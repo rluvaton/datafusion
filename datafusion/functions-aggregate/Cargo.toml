@@ -44,6 +44,7 @@ datafusion-common = { workspace = true }
 datafusion-doc = { workspace = true }
 datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true }
+datafusion-expr-common = { workspace = true }
 datafusion-functions-aggregate-common = { workspace = true }
 datafusion-macros = { workspace = true }
 datafusion-physical-expr = { workspace = true }

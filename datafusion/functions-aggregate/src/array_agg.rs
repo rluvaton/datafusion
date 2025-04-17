@@ -17,18 +17,25 @@
 
 //! `ARRAY_AGG` aggregate implementation: [`ArrayAgg`]
 
-use arrow::array::{new_empty_array, Array, ArrayRef, AsArray, ListArray, StructArray};
-use arrow::compute::SortOptions;
-use arrow::datatypes::{DataType, Field, Fields};
+use arrow::array::{
+    new_empty_array, Array, ArrayRef, AsArray, BooleanArray, ListArray, StructArray,
+};
+use arrow::compute::{concat, filter, SortOptions};
+use arrow::datatypes::{DataType, Field, FieldRef, Fields};
 
+use arrow::buffer::{BooleanBuffer, OffsetBuffer, ScalarBuffer};
 use datafusion_common::cast::as_list_array;
 use datafusion_common::utils::{get_row_at_idx, SingleRowListArrayBuilder};
 use datafusion_common::{exec_err, ScalarValue};
 use datafusion_common::{internal_err, Result};
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
-use datafusion_expr::{Accumulator, Signature, Volatility};
+use datafusion_expr::{Accumulator, EmitTo, GroupsAccumulator, Signature, Volatility};
 use datafusion_expr::{AggregateUDFImpl, Documentation};
+use datafusion_expr_common::ordering::InputOrderMode;
+use datafusion_functions_aggregate_common::aggregate::groups_accumulator::{
+    GroupsAccumulatorAdapter, VecAllocExt,
+};
 use datafusion_functions_aggregate_common::merge_arrays::merge_ordered_arrays;
 use datafusion_functions_aggregate_common::utils::ordering_fields;
 use datafusion_macros::user_doc;
@@ -36,7 +43,9 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
 use std::mem::{size_of, size_of_val};
+use std::ops::Deref;
 use std::sync::Arc;
+use std::{iter, mem};
 
 make_udaf_expr_and_func!(
     ArrayAgg,
@@ -193,6 +202,28 @@ impl AggregateUDFImpl for ArrayAgg {
 
     fn reverse_expr(&self) -> datafusion_expr::ReversedUDAF {
         datafusion_expr::ReversedUDAF::Reversed(array_agg_udaf())
+    }
+
+    fn groups_accumulator_supported(&self, acc_args: AccumulatorArgs) -> bool {
+        !acc_args.is_distinct && acc_args.ordering_req.is_empty()
+    }
+
+    fn create_groups_accumulator(
+        &self,
+        acc_args: AccumulatorArgs,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
+        if acc_args.is_distinct || !acc_args.ordering_req.is_empty() {
+            return internal_err!(
+                "DISTINCT and ORDER BY are not supported in group accumulator"
+            );
+        }
+
+        let data_type = acc_args.exprs[0].data_type(acc_args.schema)?;
+
+        Ok(Box::new(ArrayAggGroupAccumulator {
+            data_type,
+            adapter: GroupsAccumulatorAdapter::new(move || self.accumulator(acc_args)),
+        }))
     }
 
     fn documentation(&self) -> Option<&Documentation> {
@@ -352,6 +383,243 @@ impl Accumulator for ArrayAggAccumulator {
                 .sum::<usize>()
             + self.datatype.size()
             - size_of_val(&self.datatype)
+    }
+}
+
+// Too lazy to implement dedicated group accumulator
+struct ArrayAggGroupAccumulator {
+    data_type: DataType,
+    adapter: GroupsAccumulatorAdapter,
+}
+
+impl GroupsAccumulator for ArrayAggGroupAccumulator {
+    fn supports_with_group_indices_order_mode(&self) -> bool {
+        true
+    }
+
+    fn with_group_indices_order_mode(
+        self: Box<Self>,
+        group_indices_order_mode: &datafusion_expr_common::ordering::InputOrderMode,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
+        if matches!(group_indices_order_mode, InputOrderMode::Sorted) {
+            return Ok(Box::new(SortedArrayAggGroupAccumulator {
+                inputs: vec![],
+                lengths: vec![],
+                current_group: None,
+                item_data_type: self.data_type,
+            }));
+        } else {
+            return Ok(self);
+        }
+    }
+
+    fn update_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        self.adapter
+            .update_batch(values, group_indices, opt_filter, total_num_groups)
+    }
+
+    fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        self.adapter.evaluate(emit_to)
+    }
+
+    fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        self.adapter.state(emit_to)
+    }
+
+    fn merge_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        self.adapter
+            .merge_batch(values, group_indices, opt_filter, total_num_groups)
+    }
+
+    fn size(&self) -> usize {
+        self.adapter.size()
+    }
+}
+
+struct SortedArrayAggGroupAccumulator {
+    inputs: Vec<ArrayRef>,
+    lengths: Vec<usize>,
+    // (group_index, length)
+    current_group: Option<(usize, usize)>,
+    item_data_type: DataType,
+}
+
+impl GroupsAccumulator for SortedArrayAggGroupAccumulator {
+    fn update_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        let mut value = values[0].clone();
+        let mut group_indices = group_indices.to_vec();
+
+        let unwrapped_filter = opt_filter.cloned().unwrap_or_else(|filter| {
+            BooleanArray::new(BooleanBuffer::new_set(value.len()), None)
+        });
+
+        if let Some(boolean_filter) = opt_filter {
+            if boolean_filter.false_count() == boolean_filter.len() {
+                return Ok(());
+            }
+
+            value = filter(&value, boolean_filter)?;
+        }
+
+        for (group_index, valid) in group_indices
+            .into_iter()
+            .zip(unwrapped_filter.values().iter())
+        {
+            if let Some((current_group_index, length)) = self.current_group.as_mut() {
+                if group_index == *current_group_index {
+                    *length += if valid { 1 } else { 0 };
+                } else if valid {
+                    self.lengths.push(*length);
+                    self.current_group = Some((group_index, 1));
+                } else {
+                    self.lengths.push(*length);
+                    self.current_group = None;
+                }
+            } else if valid {
+                self.current_group = Some((group_index, 1));
+            }
+        }
+
+        self.inputs.push(value);
+
+        Ok(())
+    }
+
+    fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        match emit_to {
+            EmitTo::All => {
+                if let Some((_, count)) = self.current_group.take() {
+                    self.lengths.push(count);
+                }
+
+                let inputs = std::mem::take(&mut self.inputs);
+                let child_inputs =
+                    inputs.iter().map(|arr| arr.deref()).collect::<Vec<_>>();
+                let child = concat(child_inputs.as_slice())?;
+
+                let lengths = std::mem::take(&mut self.lengths);
+
+                let list = ListArray::try_new(
+                    Arc::new(Field::new_list_field(self.item_data_type.clone(), true)),
+                    OffsetBuffer::from_lengths(lengths),
+                    child,
+                    None,
+                )?;
+
+                return Ok(Arc::new(list));
+            }
+            EmitTo::First(n) => {
+                if n == self.lengths.len() {
+                    return self.evaluate(EmitTo::All);
+                }
+
+                if let Some((group_index, _)) = self.current_group.as_mut() {
+                    *group_index -= n;
+                }
+
+                let list_offsets = {
+                    let mut remaining_lengths = self.lengths.split_off(n);
+
+                    let current_list_lengths =
+                        mem::replace(&mut self.lengths, remaining_lengths);
+
+                    OffsetBuffer::<i32>::from_lengths(current_list_lengths)
+                };
+
+                let total_length = list_offsets[list_offsets.len() - 1] as usize;
+
+                let mut running_length = 0;
+                let mut input_for_next_emit = self.inputs[0].clone();
+
+                let mut child = input_for_next_emit.clone();
+                let mut child_inputs = vec![];
+                let mut index_to_split = 0;
+                for (index, input) in self.inputs.iter().enumerate() {
+                    if running_length + input.len() > total_length {
+                        let offset = total_length - running_length;
+                        let remaining = input.slice(0, offset);
+                        child_inputs.push(remaining.deref());
+                        input_for_next_emit = input.slice(offset, input.len() - offset);
+                        child = concat(child_inputs.as_slice())?;
+                        index_to_split = index;
+                        break;
+                    }
+
+                    child_inputs.push(input.deref());
+
+                    running_length += input.len();
+                }
+
+                self.inputs = self.inputs.split_off(index_to_split);
+
+                let list = ListArray::try_new(
+                    Arc::new(Field::new_list_field(self.item_data_type.clone(), true)),
+                    list_offsets,
+                    child,
+                    None,
+                )?;
+
+                return Ok(Arc::new(list));
+            }
+        }
+    }
+
+    fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        Ok(vec![self.evaluate(emit_to)?])
+    }
+
+    fn merge_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        let value = values[0].as_list();
+
+        let child = value.values().slice(value.value_offsets()[0], value.len());
+
+        let group_indices = group_indices
+            .into_iter()
+            .zip(value.offsets().lengths())
+            .flat_map(|(index, length)| iter::repeat_n(*index, length))
+            .collect::<Vec<_>>();
+
+        let flattened_filter: Option<BooleanArray> = opt_filter.cloned().map(|f| {
+            f.iter()
+                .zip(value.offsets().lengths())
+                .flat_map(|(valid, length)| iter::repeat_n(valid, length))
+                .into()
+        });
+
+        self.update_batch(
+            &[child],
+            &group_indices,
+            flattened_filter.as_ref(),
+            total_num_groups,
+        )
+    }
+
+    fn size(&self) -> usize {
+        self.lengths.allocated_size() + self.inputs.allocated_size()
     }
 }
 

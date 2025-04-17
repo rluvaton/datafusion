@@ -2291,6 +2291,7 @@ dependencies = [
  "datafusion-doc",
  "datafusion-execution",
  "datafusion-expr",
+ "datafusion-expr-common",
  "datafusion-functions-aggregate-common",
  "datafusion-macros",
  "datafusion-physical-expr",
