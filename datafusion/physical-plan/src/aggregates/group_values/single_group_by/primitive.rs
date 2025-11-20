@@ -94,7 +94,7 @@ pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
     /// The values for each group index
     values: Vec<T::Native>,
     /// The random state used to generate hashes
-    random_state: rapidhash::fast::SeedableState<'static>,
+    random_state: rapidhash::quality::SeedableState<'static>,
 }
 
 impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {

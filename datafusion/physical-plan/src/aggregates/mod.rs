@@ -79,8 +79,8 @@ const AGGREGATE_SEED: u64 = u32::from_be_bytes(*b"AGGR") as u64;
 const AGGREGATION_HASH_SEED: ahash::RandomState =
     ahash::RandomState::with_seeds('A' as u64, 'G' as u64, 'G' as u64, 'R' as u64);
 
-fn create_aggregation_hash_seed() -> rapidhash::fast::SeedableState<'static> {
-    rapidhash::fast::SeedableState::new(AGGREGATE_SEED)
+fn create_aggregation_hash_seed() -> rapidhash::quality::SeedableState<'static> {
+    rapidhash::quality::SeedableState::new(AGGREGATE_SEED)
 }
 
 /// Aggregation modes

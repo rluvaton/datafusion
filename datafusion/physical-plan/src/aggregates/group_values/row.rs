@@ -75,7 +75,7 @@ pub struct GroupValuesRows {
     rows_buffer: Rows,
 
     /// Random state for creating hashes
-    random_state: rapidhash::fast::SeedableState<'static>,
+    random_state: rapidhash::quality::SeedableState<'static>,
 }
 
 impl GroupValuesRows {

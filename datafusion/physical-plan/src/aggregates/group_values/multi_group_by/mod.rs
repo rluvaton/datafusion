@@ -219,7 +219,7 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     hashes_buffer: Vec<u64>,
 
     /// Random state for creating hashes
-    random_state: rapidhash::fast::SeedableState<'static>,
+    random_state: rapidhash::quality::SeedableState<'static>,
 }
 
 /// Buffers to store intermediate results in `vectorized_append`
