@@ -64,6 +64,7 @@ use datafusion_physical_expr_common::sort_expr::{
 use datafusion_expr::utils::AggregateOrderSensitivity;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use itertools::Itertools;
+use datafusion_common::hash_utils::CustomRandomState;
 
 pub mod group_values;
 mod no_grouping;
@@ -72,9 +73,14 @@ mod row_hash;
 mod topk;
 mod topk_stream;
 
+
 /// Hard-coded seed for aggregations to ensure hash values differ from `RepartitionExec`, avoiding collisions.
-const AGGREGATION_HASH_SEED: rapidhash::fast::SeedableState =
-    rapidhash::fast::SeedableState::new(u32::from_be_bytes(*b"AGGR") as u64);
+const AGGREGATION_HASH_SEED: ahash::RandomState =
+    ahash::RandomState::with_seeds('A' as u64, 'G' as u64, 'G' as u64, 'R' as u64);
+
+fn create_aggregation_hash_seed() -> impl CustomRandomState {
+    rapidhash::fast::SeedableState::new(u32::from_be_bytes(*b"AGGR") as u64)
+}
 
 /// Aggregation modes
 ///

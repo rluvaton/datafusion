@@ -32,6 +32,7 @@ use half::f16;
 use hashbrown::raw::RawTable;
 use std::fmt::Debug;
 use std::sync::Arc;
+use datafusion_common::hash_utils::CustomRandomState;
 
 /// A "type alias" for Keys which are stored in our map
 pub trait KeyType: Clone + Comparable + Debug {}
@@ -384,7 +385,7 @@ impl<ID: KeyType> HashTableItem<ID> {
 }
 
 impl HashValue for Option<String> {
-    fn hash(&self, state: &RandomState) -> u64 {
+    fn hash(&self, state: &impl CustomRandomState) -> u64 {
         state.hash_one(self)
     }
 }
@@ -392,7 +393,7 @@ impl HashValue for Option<String> {
 macro_rules! hash_float {
     ($($t:ty),+) => {
         $(impl HashValue for Option<$t> {
-            fn hash(&self, state: &RandomState) -> u64 {
+            fn hash(&self, state: &impl CustomRandomState) -> u64 {
                 self.map(|me| me.hash(state)).unwrap_or(0)
             }
         })+
@@ -402,7 +403,7 @@ macro_rules! hash_float {
 macro_rules! has_integer {
     ($($t:ty),+) => {
         $(impl HashValue for Option<$t> {
-            fn hash(&self, state: &RandomState) -> u64 {
+            fn hash(&self, state: &impl CustomRandomState) -> u64 {
                 self.map(|me| me.hash(state)).unwrap_or(0)
             }
         })+
