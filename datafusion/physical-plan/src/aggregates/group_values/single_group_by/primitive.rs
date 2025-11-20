@@ -47,7 +47,7 @@ macro_rules! hash_integer {
             }
 
             #[cfg(feature = "force_hash_collisions")]
-            fn hash(&self, _state: &&impl CustomRandomState) -> u64 {
+            fn hash(&self, _state: &impl CustomRandomState) -> u64 {
                 0
             }
         })+
@@ -61,12 +61,12 @@ macro_rules! hash_float {
     ($($t:ty),+) => {
         $(impl HashValue for $t {
             #[cfg(not(feature = "force_hash_collisions"))]
-            fn hash(&self, state: &&impl CustomRandomState) -> u64 {
+            fn hash(&self, state: &impl CustomRandomState) -> u64 {
                 state.hash_one(self.to_bits())
             }
 
             #[cfg(feature = "force_hash_collisions")]
-            fn hash(&self, _state: &&impl CustomRandomState) -> u64 {
+            fn hash(&self, _state: &impl CustomRandomState) -> u64 {
                 0
             }
         })+
