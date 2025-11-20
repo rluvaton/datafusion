@@ -78,6 +78,7 @@ pyo3 = { version = "0.26", optional = true }
 recursive = { workspace = true, optional = true }
 sqlparser = { workspace = true, optional = true }
 tokio = { workspace = true }
+rapidhash = { workspace = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 web-time = "1.1.0"

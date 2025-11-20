@@ -31,22 +31,23 @@ use half::f16;
 use hashbrown::hash_table::HashTable;
 use std::mem::size_of;
 use std::sync::Arc;
+use datafusion_common::hash_utils::CustomRandomState;
 
 /// A trait to allow hashing of floating point numbers
 pub(crate) trait HashValue {
-    fn hash(&self, state: &RandomState) -> u64;
+    fn hash(&self, state: &impl CustomRandomState) -> u64;
 }
 
 macro_rules! hash_integer {
     ($($t:ty),+) => {
         $(impl HashValue for $t {
             #[cfg(not(feature = "force_hash_collisions"))]
-            fn hash(&self, state: &RandomState) -> u64 {
+            fn hash(&self, state: &impl CustomRandomState) -> u64 {
                 state.hash_one(self)
             }
 
             #[cfg(feature = "force_hash_collisions")]
-            fn hash(&self, _state: &RandomState) -> u64 {
+            fn hash(&self, _state: &&impl CustomRandomState) -> u64 {
                 0
             }
         })+
@@ -60,12 +61,12 @@ macro_rules! hash_float {
     ($($t:ty),+) => {
         $(impl HashValue for $t {
             #[cfg(not(feature = "force_hash_collisions"))]
-            fn hash(&self, state: &RandomState) -> u64 {
+            fn hash(&self, state: &&impl CustomRandomState) -> u64 {
                 state.hash_one(self.to_bits())
             }
 
             #[cfg(feature = "force_hash_collisions")]
-            fn hash(&self, _state: &RandomState) -> u64 {
+            fn hash(&self, _state: &&impl CustomRandomState) -> u64 {
                 0
             }
         })+
@@ -93,7 +94,7 @@ pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
     /// The values for each group index
     values: Vec<T::Native>,
     /// The random state used to generate hashes
-    random_state: RandomState,
+    random_state: rapidhash::fast::SeedableState<'static>,
 }
 
 impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {

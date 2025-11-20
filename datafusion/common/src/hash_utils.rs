@@ -17,7 +17,6 @@
 
 //! Functionality used both on logical and physical plans
 
-use ahash::RandomState;
 use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
 use arrow::array::*;
 use arrow::datatypes::*;
@@ -33,6 +32,7 @@ use crate::cast::{
 use crate::error::Result;
 use crate::error::{_internal_datafusion_err, _internal_err};
 use std::cell::RefCell;
+use std::hash::{BuildHasher, Hash, Hasher};
 
 // Combines two hashes into one hash
 #[inline]
@@ -88,13 +88,13 @@ thread_local! {
 /// ```
 pub fn with_hashes<I, T, F, R>(
     arrays: I,
-    random_state: &RandomState,
+    random_state: &impl CustomRandomState,
     callback: F,
 ) -> Result<R>
 where
-    I: IntoIterator<Item = T>,
-    T: AsDynArray,
-    F: FnOnce(&[u64]) -> Result<R>,
+  I: IntoIterator<Item = T>,
+  T: AsDynArray,
+  F: FnOnce(&[u64]) -> Result<R>,
 {
     // Peek at the first array to determine buffer size without fully collecting
     let mut iter = arrays.into_iter().peekable();
@@ -107,7 +107,7 @@ where
 
     HASH_BUFFER.try_with(|cell| {
         let mut buffer = cell.try_borrow_mut()
-            .map_err(|_| _internal_datafusion_err!("with_hashes cannot be called reentrantly on the same thread"))?;
+          .map_err(|_| _internal_datafusion_err!("with_hashes cannot be called reentrantly on the same thread"))?;
 
         // Ensure buffer has sufficient length, clearing old values
         buffer.clear();
@@ -129,8 +129,35 @@ where
     }).map_err(|_| _internal_datafusion_err!("with_hashes cannot access thread-local storage during or after thread destruction"))?
 }
 
+
+pub trait CustomRandomState {
+    fn hash_one<T: Hash>(&self, t: T) -> u64;
+}
+
+impl<const AVALANCHE: bool, const SPONGE: bool, const COMPACT: bool, const PROTECTED: bool> CustomRandomState for rapidhash::inner::RandomState<AVALANCHE, SPONGE, COMPACT, PROTECTED> {
+    fn hash_one<T: Hash>(&self, t: T) -> u64 {
+        let mut hasher = self.build_hasher();
+        t.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+impl<'a, const AVALANCHE: bool, const SPONGE: bool, const COMPACT: bool, const PROTECTED: bool> CustomRandomState for rapidhash::inner::SeedableState<'a, AVALANCHE, SPONGE, COMPACT, PROTECTED> {
+    fn hash_one<T: Hash>(&self, t: T) -> u64 {
+        let mut hasher = self.build_hasher();
+        t.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+impl CustomRandomState for ahash::RandomState {
+    fn hash_one<T: Hash>(&self, t: T) -> u64 {
+        self.hash_one(t)
+    }
+}
+
+
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_null(random_state: &RandomState, hashes_buffer: &'_ mut [u64], mul_col: bool) {
+fn hash_null(random_state: &impl CustomRandomState, hashes_buffer: &'_ mut [u64], mul_col: bool) {
     if mul_col {
         hashes_buffer.iter_mut().for_each(|hash| {
             // stable hash for null value
@@ -144,19 +171,18 @@ fn hash_null(random_state: &RandomState, hashes_buffer: &'_ mut [u64], mul_col: 
 }
 
 pub trait HashValue {
-    fn hash_one(&self, state: &RandomState) -> u64;
+    fn hash_one(&self, state: &impl CustomRandomState) -> u64;
 }
 
 impl<T: HashValue + ?Sized> HashValue for &T {
-    fn hash_one(&self, state: &RandomState) -> u64 {
+    fn hash_one(&self, state: &impl CustomRandomState) -> u64 {
         T::hash_one(self, state)
     }
 }
-
 macro_rules! hash_value {
     ($($t:ty),+) => {
         $(impl HashValue for $t {
-            fn hash_one(&self, state: &RandomState) -> u64 {
+            fn hash_one(&self, state: &impl CustomRandomState) -> u64 {
                 state.hash_one(self)
             }
         })+
@@ -168,7 +194,7 @@ hash_value!(bool, str, [u8], IntervalDayTime, IntervalMonthDayNano);
 macro_rules! hash_float_value {
     ($(($t:ty, $i:ty)),+) => {
         $(impl HashValue for $t {
-            fn hash_one(&self, state: &RandomState) -> u64 {
+            fn hash_one(&self, state: &impl CustomRandomState) -> u64 {
                 state.hash_one(<$i>::from_ne_bytes(self.to_ne_bytes()))
             }
         })+
@@ -182,11 +208,11 @@ hash_float_value!((half::f16, u16), (f32, u32), (f64, u64));
 #[cfg(not(feature = "force_hash_collisions"))]
 fn hash_array_primitive<T>(
     array: &PrimitiveArray<T>,
-    random_state: &RandomState,
+    random_state: &impl CustomRandomState,
     hashes_buffer: &mut [u64],
     rehash: bool,
 ) where
-    T: ArrowPrimitiveType<Native: HashValue>,
+  T: ArrowPrimitiveType<Native: HashValue>,
 {
     assert_eq!(
         hashes_buffer.len(),
@@ -227,12 +253,12 @@ fn hash_array_primitive<T>(
 #[cfg(not(feature = "force_hash_collisions"))]
 fn hash_array<T>(
     array: &T,
-    random_state: &RandomState,
+    random_state: &impl CustomRandomState,
     hashes_buffer: &mut [u64],
     rehash: bool,
 ) where
-    T: ArrayAccessor,
-    T::Item: HashValue,
+  T: ArrayAccessor,
+  T::Item: HashValue,
 {
     assert_eq!(
         hashes_buffer.len(),
@@ -293,7 +319,7 @@ fn update_hash_for_dict_key(
 #[cfg(not(feature = "force_hash_collisions"))]
 fn hash_dictionary<K: ArrowDictionaryKeyType>(
     array: &DictionaryArray<K>,
-    random_state: &RandomState,
+    random_state: &impl CustomRandomState,
     hashes_buffer: &mut [u64],
     multi_col: bool,
 ) -> Result<()> {
@@ -323,7 +349,7 @@ fn hash_dictionary<K: ArrowDictionaryKeyType>(
 #[cfg(not(feature = "force_hash_collisions"))]
 fn hash_struct_array(
     array: &StructArray,
-    random_state: &RandomState,
+    random_state: &impl CustomRandomState,
     hashes_buffer: &mut [u64],
 ) -> Result<()> {
     let nulls = array.nulls();
@@ -351,7 +377,7 @@ fn hash_struct_array(
 #[cfg(not(feature = "force_hash_collisions"))]
 fn hash_map_array(
     array: &MapArray,
-    random_state: &RandomState,
+    random_state: &impl CustomRandomState,
     hashes_buffer: &mut [u64],
 ) -> Result<()> {
     let nulls = array.nulls();
@@ -386,11 +412,11 @@ fn hash_map_array(
 #[cfg(not(feature = "force_hash_collisions"))]
 fn hash_list_array<OffsetSize>(
     array: &GenericListArray<OffsetSize>,
-    random_state: &RandomState,
+    random_state: &impl CustomRandomState,
     hashes_buffer: &mut [u64],
 ) -> Result<()>
 where
-    OffsetSize: OffsetSizeTrait,
+  OffsetSize: OffsetSizeTrait,
 {
     let values = array.values();
     let offsets = array.value_offsets();
@@ -420,7 +446,7 @@ where
 #[cfg(not(feature = "force_hash_collisions"))]
 fn hash_union_array(
     array: &UnionArray,
-    random_state: &RandomState,
+    random_state: &impl CustomRandomState,
     hashes_buffer: &mut [u64],
 ) -> Result<()> {
     use std::collections::HashMap;
@@ -454,7 +480,7 @@ fn hash_union_array(
 #[cfg(not(feature = "force_hash_collisions"))]
 fn hash_fixed_list_array(
     array: &FixedSizeListArray,
-    random_state: &RandomState,
+    random_state: &impl CustomRandomState,
     hashes_buffer: &mut [u64],
 ) -> Result<()> {
     let values = array.values();
@@ -489,7 +515,7 @@ fn hash_fixed_list_array(
 #[cfg(not(feature = "force_hash_collisions"))]
 fn hash_single_array(
     array: &dyn Array,
-    random_state: &RandomState,
+    random_state: &impl CustomRandomState,
     hashes_buffer: &mut [u64],
     rehash: bool,
 ) -> Result<()> {
@@ -603,12 +629,12 @@ impl AsDynArray for &ArrayRef {
 /// `hashes_buffer` should be pre-sized appropriately.
 pub fn create_hashes<'a, I, T>(
     arrays: I,
-    random_state: &RandomState,
+    random_state: &impl CustomRandomState,
     hashes_buffer: &'a mut [u64],
 ) -> Result<&'a mut [u64]>
 where
-    I: IntoIterator<Item = T>,
-    T: AsDynArray,
+  I: IntoIterator<Item = T>,
+  T: AsDynArray,
 {
     for (i, array) in arrays.into_iter().enumerate() {
         // combine hashes with `combine_hashes` for all columns besides the first
@@ -625,17 +651,18 @@ mod tests {
     use arrow::array::*;
     #[cfg(not(feature = "force_hash_collisions"))]
     use arrow::datatypes::*;
+    use ahash::RandomState;
 
     use super::*;
 
     #[test]
     fn create_hashes_for_decimal_array() -> Result<()> {
         let array = vec![1, 2, 3, 4]
-            .into_iter()
-            .map(Some)
-            .collect::<Decimal128Array>()
-            .with_precision_and_scale(20, 3)
-            .unwrap();
+          .into_iter()
+          .map(Some)
+          .collect::<Decimal128Array>()
+          .with_precision_and_scale(20, 3)
+          .unwrap();
         let array_ref: ArrayRef = Arc::new(array);
         let random_state = RandomState::with_seeds(0, 0, 0, 0);
         let hashes_buff = &mut vec![0; array_ref.len()];
@@ -661,9 +688,9 @@ mod tests {
     #[test]
     fn create_hashes_for_float_arrays() -> Result<()> {
         let f32_arr: ArrayRef =
-            Arc::new(Float32Array::from(vec![0.12, 0.5, 1f32, 444.7]));
+          Arc::new(Float32Array::from(vec![0.12, 0.5, 1f32, 444.7]));
         let f64_arr: ArrayRef =
-            Arc::new(Float64Array::from(vec![0.12, 0.5, 1f64, 444.7]));
+          Arc::new(Float64Array::from(vec![0.12, 0.5, 1f64, 444.7]));
 
         let random_state = RandomState::with_seeds(0, 0, 0, 0);
         let hashes_buff = &mut vec![0; f32_arr.len()];
@@ -733,12 +760,12 @@ mod tests {
     fn create_hashes_fixed_size_binary() -> Result<()> {
         let input_arg = vec![vec![1, 2], vec![5, 6], vec![5, 6]];
         let fixed_size_binary_array: ArrayRef =
-            Arc::new(FixedSizeBinaryArray::try_from_iter(input_arg.into_iter()).unwrap());
+          Arc::new(FixedSizeBinaryArray::try_from_iter(input_arg.into_iter()).unwrap());
 
         let random_state = RandomState::with_seeds(0, 0, 0, 0);
         let hashes_buff = &mut vec![0; fixed_size_binary_array.len()];
         let hashes =
-            create_hashes(&[fixed_size_binary_array], &random_state, hashes_buff)?;
+          create_hashes(&[fixed_size_binary_array], &random_state, hashes_buff)?;
         assert_eq!(hashes.len(), 3,);
 
         Ok(())
@@ -810,12 +837,12 @@ mod tests {
         let strings = [Some("foo"), None, Some("bar"), Some("foo"), None];
 
         let string_array: ArrayRef =
-            Arc::new(strings.iter().cloned().collect::<StringArray>());
+          Arc::new(strings.iter().cloned().collect::<StringArray>());
         let dict_array: ArrayRef = Arc::new(
             strings
-                .iter()
-                .cloned()
-                .collect::<DictionaryArray<Int8Type>>(),
+              .iter()
+              .cloned()
+              .collect::<DictionaryArray<Int8Type>>(),
         );
 
         let random_state = RandomState::with_seeds(0, 0, 0, 0);
@@ -862,7 +889,7 @@ mod tests {
             Some(vec![]),
         ];
         let list_array =
-            Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(data)) as ArrayRef;
+          Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(data)) as ArrayRef;
         let random_state = RandomState::with_seeds(0, 0, 0, 0);
         let mut hashes = vec![0; list_array.len()];
         create_hashes(&[list_array], &random_state, &mut hashes).unwrap();
@@ -885,9 +912,9 @@ mod tests {
             Some(vec![Some(0), Some(1), Some(2)]),
         ];
         let list_array =
-            Arc::new(FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
-                data, 3,
-            )) as ArrayRef;
+          Arc::new(FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
+              data, 3,
+          )) as ArrayRef;
         let random_state = RandomState::with_seeds(0, 0, 0, 0);
         let mut hashes = vec![0; list_array.len()];
         create_hashes(&[list_array], &random_state, &mut hashes).unwrap();
@@ -986,7 +1013,7 @@ mod tests {
     #[cfg(not(feature = "force_hash_collisions"))]
     fn create_hashes_for_map_arrays() {
         let mut builder =
-            MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+          MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
         // Row 0
         builder.keys().append_value("key1");
         builder.keys().append_value("key2");
@@ -1047,12 +1074,12 @@ mod tests {
         let strings2 = [Some("blarg"), Some("blah"), None];
 
         let string_array: ArrayRef =
-            Arc::new(strings1.iter().cloned().collect::<StringArray>());
+          Arc::new(strings1.iter().cloned().collect::<StringArray>());
         let dict_array: ArrayRef = Arc::new(
             strings2
-                .iter()
-                .cloned()
-                .collect::<DictionaryArray<Int32Type>>(),
+              .iter()
+              .cloned()
+              .collect::<DictionaryArray<Int32Type>>(),
         );
 
         let random_state = RandomState::with_seeds(0, 0, 0, 0);
@@ -1063,7 +1090,7 @@ mod tests {
             &random_state,
             &mut one_col_hashes,
         )
-        .unwrap();
+          .unwrap();
 
         let mut two_col_hashes = vec![0; strings1.len()];
         create_hashes(
@@ -1071,7 +1098,7 @@ mod tests {
             &random_state,
             &mut two_col_hashes,
         )
-        .unwrap();
+          .unwrap();
 
         assert_eq!(one_col_hashes.len(), 3);
         assert_eq!(two_col_hashes.len(), 3);
@@ -1083,12 +1110,12 @@ mod tests {
     fn test_create_hashes_from_arrays() {
         let int_array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
         let float_array: ArrayRef =
-            Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0]));
+          Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0]));
 
         let random_state = RandomState::with_seeds(0, 0, 0, 0);
         let hashes_buff = &mut vec![0; int_array.len()];
         let hashes =
-            create_hashes(&[int_array, float_array], &random_state, hashes_buff).unwrap();
+          create_hashes(&[int_array, float_array], &random_state, hashes_buff).unwrap();
         assert_eq!(hashes.len(), 4,);
     }
 
@@ -1096,7 +1123,7 @@ mod tests {
     fn test_create_hashes_from_dyn_arrays() {
         let int_array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
         let float_array: ArrayRef =
-            Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0]));
+          Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0]));
 
         // Verify that we can call create_hashes with only &dyn Array
         fn test(arr1: &dyn Array, arr2: &dyn Array) {
@@ -1119,7 +1146,7 @@ mod tests {
             &random_state,
             &mut hashes1,
         )
-        .unwrap();
+          .unwrap();
 
         let mut hashes2 = vec![0; array.len()];
         create_hashes([array], &random_state, &mut hashes2).unwrap();
@@ -1143,7 +1170,7 @@ mod tests {
             // Return a copy of the hashes
             Ok(hashes.to_vec())
         })
-        .unwrap();
+          .unwrap();
 
         // Verify callback result is returned correctly
         assert_eq!(result, expected_hashes);
@@ -1162,14 +1189,14 @@ mod tests {
             &random_state,
             &mut expected_hashes,
         )
-        .unwrap();
+          .unwrap();
 
         with_hashes([&int_array, &str_array], &random_state, |hashes| {
             assert_eq!(hashes.len(), 3);
             assert_eq!(hashes, &expected_hashes[..]);
             Ok(())
         })
-        .unwrap();
+          .unwrap();
     }
 
     #[test]
@@ -1182,9 +1209,9 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("requires at least one array"));
+          .unwrap_err()
+          .to_string()
+          .contains("requires at least one array"));
     }
 
     #[test]
@@ -1224,8 +1251,8 @@ mod tests {
             (0, Arc::new(Field::new("a", DataType::Int32, true))),
             (1, Arc::new(Field::new("b", DataType::Utf8, true))),
         ]
-        .into_iter()
-        .collect();
+          .into_iter()
+          .collect();
 
         let array = UnionArray::try_new(union_fields, type_ids, None, children).unwrap();
         let array_ref = Arc::new(array) as ArrayRef;
@@ -1259,8 +1286,8 @@ mod tests {
             (0, Arc::new(Field::new("a", DataType::Int32, true))),
             (1, Arc::new(Field::new("b", DataType::Utf8, true))),
         ]
-        .into_iter()
-        .collect();
+          .into_iter()
+          .collect();
 
         let array = UnionArray::try_new(union_fields, type_ids, None, children).unwrap();
         let array_ref = Arc::new(array) as ArrayRef;
@@ -1299,11 +1326,11 @@ mod tests {
             (0, Arc::new(Field::new("a", DataType::Int32, false))),
             (1, Arc::new(Field::new("b", DataType::Utf8, false))),
         ]
-        .into_iter()
-        .collect();
+          .into_iter()
+          .collect();
 
         let array =
-            UnionArray::try_new(union_fields, type_ids, Some(offsets), children).unwrap();
+          UnionArray::try_new(union_fields, type_ids, Some(offsets), children).unwrap();
         let array_ref = Arc::new(array) as ArrayRef;
 
         let random_state = RandomState::with_seeds(0, 0, 0, 0);

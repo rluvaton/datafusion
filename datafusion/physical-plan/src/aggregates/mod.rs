@@ -40,7 +40,7 @@ use datafusion_physical_expr::utils::collect_columns;
 use std::collections::HashSet;
 
 use arrow::array::{ArrayRef, UInt16Array, UInt32Array, UInt64Array, UInt8Array};
-use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::datatypes::{Field, Schema, SchemaRef, ToByteSlice};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::FieldRef;
 use datafusion_common::stats::Precision;
@@ -73,8 +73,8 @@ mod topk;
 mod topk_stream;
 
 /// Hard-coded seed for aggregations to ensure hash values differ from `RepartitionExec`, avoiding collisions.
-const AGGREGATION_HASH_SEED: ahash::RandomState =
-    ahash::RandomState::with_seeds('A' as u64, 'G' as u64, 'G' as u64, 'R' as u64);
+const AGGREGATION_HASH_SEED: rapidhash::fast::SeedableState =
+    rapidhash::fast::SeedableState::new(u32::from_be_bytes(*b"AGGR") as u64);
 
 /// Aggregation modes
 ///
