@@ -73,13 +73,14 @@ mod row_hash;
 mod topk;
 mod topk_stream;
 
+const AGGREGATE_SEED: u64 = u32::from_be_bytes(*b"AGGR") as u64;
 
 /// Hard-coded seed for aggregations to ensure hash values differ from `RepartitionExec`, avoiding collisions.
 const AGGREGATION_HASH_SEED: ahash::RandomState =
     ahash::RandomState::with_seeds('A' as u64, 'G' as u64, 'G' as u64, 'R' as u64);
 
-fn create_aggregation_hash_seed() -> impl CustomRandomState {
-    rapidhash::fast::SeedableState::new(u32::from_be_bytes(*b"AGGR") as u64)
+fn create_aggregation_hash_seed() -> rapidhash::fast::SeedableState<'static> {
+    rapidhash::fast::SeedableState::new(AGGREGATE_SEED)
 }
 
 /// Aggregation modes
