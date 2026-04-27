@@ -192,6 +192,10 @@ pub fn register_all(registry: &mut dyn FunctionRegistry) -> Result<()> {
     Ok(())
 }
 
+pub fn call_function_nested() {
+    
+}
+
 #[cfg(test)]
 mod tests {
     use crate::all_default_nested_functions;

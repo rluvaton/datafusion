@@ -48,3 +48,8 @@ pub use disk_manager::DiskManager;
 pub use registry::FunctionRegistry;
 pub use stream::{RecordBatchStream, SendableRecordBatchStream};
 pub use task::{TaskContext, TaskContextProvider};
+
+
+pub fn this_new_exec() {
+    
+}

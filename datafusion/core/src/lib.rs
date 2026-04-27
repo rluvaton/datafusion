@@ -891,6 +891,10 @@ pub mod variable {
     pub use datafusion_expr::var_provider::{VarProvider, VarType};
 }
 
+pub fn call() {
+    
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod test;
 
