@@ -59,6 +59,20 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
+          echo "::group::debug: git refs"
+          git rev-parse HEAD "origin/${BASE_REF}" || true
+          echo "::endgroup::"
+          echo "::group::debug: git diff --name-only"
+          git diff --name-only "origin/${BASE_REF}...HEAD" || true
+          echo "::endgroup::"
+          echo "::group::debug: cargo metadata + jq"
+          cargo metadata --no-deps --format-version 1 | jq -r '
+            .workspace_root + "/" as $root
+            | .packages[]
+            | select(.publish != [])
+            | "\(.name) \(.manifest_path | ltrimstr($root) | rtrimstr("/Cargo.toml"))"
+          ' | head -5
+          echo "::endgroup::"
           PACKAGES=$(ci/scripts/changed_crates.sh changed-crates "origin/${BASE_REF}")
           echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
           echo "Changed crates: $PACKAGES"
