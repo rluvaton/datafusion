@@ -891,7 +891,7 @@ pub mod variable {
     pub use datafusion_expr::var_provider::{VarProvider, VarType};
 }
 
-pub fn call() {
+pub fn call_renamed() {
     
 }
 

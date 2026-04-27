@@ -50,6 +50,6 @@ pub use stream::{RecordBatchStream, SendableRecordBatchStream};
 pub use task::{TaskContext, TaskContextProvider};
 
 
-pub fn this_new_exec() {
+pub fn this_new_exec(_new_arg: u32) {
     
 }
