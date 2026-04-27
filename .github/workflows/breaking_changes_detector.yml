@@ -54,13 +54,6 @@ jobs:
           REPO: ${{ github.repository }}
         run: git fetch "https://github.com/${REPO}.git" "${BASE_REF}:refs/remotes/origin/${BASE_REF}"
 
-      - name: log changed
-        id: changed_crates_tmp
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          ci/scripts/changed_crates.sh changed-crates "origin/${BASE_REF}"
-
       - name: Determine changed crates
         id: changed_crates
         env:
@@ -86,7 +79,15 @@ jobs:
           set +e
           # `tee` lets cargo's output stream live into the Actions log
           # while we also keep a copy for the PR comment.
-          ci/scripts/changed_crates.sh semver-check "origin/${BASE_REF}" $PACKAGES
+          ci/scripts/changed_crates.sh semver-check "origin/${BASE_REF}" $PACKAGES \
+            2>&1 | tee /tmp/semver-output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          {
+            echo "logs<<EOF"
+            sed 's/\x1b\[[0-9;]*m//g' /tmp/semver-output.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          exit $EXIT_CODE
 
   # Post or remove a sticky comment on the PR based on the semver check result.
   comment-on-pr:
