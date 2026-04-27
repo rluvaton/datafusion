@@ -46,6 +46,7 @@ cmd_changed_crates() {
   # 1. Files changed between the PR and the base branch.
   local changed_files
   changed_files=$(git diff --name-only "${base_ref}...HEAD")
+  echo "changed files: $changed_files"
 
   # 2. Every publishable workspace member, one per line as
   #    "<crate-name> <crate-dir>". `publish = false` in Cargo.toml shows
@@ -58,11 +59,17 @@ cmd_changed_crates() {
     | select(.publish != [])
     | "\(.name) \(.manifest_path | ltrimstr($root) | rtrimstr("/Cargo.toml"))"
   ')
+  
+  echo "crates: $crates"
 
   # 3. Keep crates whose directory contains a changed file.
   while read -r name dir; do
+      echo "checking $name which is in $dir against $changed_files"
     if grep -q "^${dir}/" <<<"$changed_files"; then
+        echo "matched"
       echo "$name"
+    else
+        echo "not matched $name"
     fi
   done <<<"$crates" | xargs
 }
