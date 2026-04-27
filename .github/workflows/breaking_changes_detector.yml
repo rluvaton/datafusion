@@ -54,6 +54,13 @@ jobs:
           REPO: ${{ github.repository }}
         run: git fetch "https://github.com/${REPO}.git" "${BASE_REF}:refs/remotes/origin/${BASE_REF}"
 
+      - name: log changed
+        id: changed_crates_tmp
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          ci/scripts/changed_crates.sh changed-crates "origin/${BASE_REF}"
+
       - name: Determine changed crates
         id: changed_crates
         env:
