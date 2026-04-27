@@ -64,14 +64,18 @@ cmd_changed_crates() {
 
   # 3. Keep crates whose directory contains a changed file.
   while read -r name dir; do
-      echo "checking $name which is in $dir against $changed_files"
+      echo ""
+      echo "checking $name which is in $dir"
+      echo "----"
+      echo "$changed_files"
+      echo ""
     if grep -q "^${dir}/" <<<"$changed_files"; then
         echo "matched"
       echo "$name"
     else
         echo "not matched $name"
     fi
-  done <<<"$crates" | xargs
+  done <<<"$crates"
 }
 
 # ── semver-check ────────────────────────────────────────────────────
