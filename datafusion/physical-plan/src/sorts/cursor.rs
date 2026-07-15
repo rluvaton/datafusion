@@ -102,13 +102,8 @@ impl<T: CursorValues> Cursor<T> {
     /// Advance the cursor, returning the previous row index
     #[inline]
     pub fn advance(&mut self) -> usize {
-        self.advance_n(1)
-    }
-
-    #[inline]
-    pub(crate) fn advance_n(&mut self, n: usize) -> usize {
         let t = self.offset;
-        self.offset += n;
+        self.offset += 1;
         // Refresh the cache for the new position. The guard keeps `set_offset`
         // in bounds; a finished cursor's stale cache is never read (it is taken
         // before the next comparison).
@@ -126,10 +121,6 @@ impl<T: CursorValues> Cursor<T> {
         } else {
             false
         }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.values.len() - self.offset
     }
 }
 
