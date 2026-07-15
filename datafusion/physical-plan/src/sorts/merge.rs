@@ -35,7 +35,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_execution::{TryEmitter, async_try_stream};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::coalesce_batches::CoalesceBatchesStream;
 use futures::Stream;
@@ -320,7 +320,6 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         mut emitter: TryEmitter<RecordBatch, DataFusionError>,
         last_stream_index: usize,
     ) -> Result<()> {
-
         let elapsed_compute = self.metrics.elapsed_compute().clone();
         let mut timer = elapsed_compute.timer();
 
@@ -348,9 +347,12 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
             // otherwise they would be silently dropped.
             // Repeated overflows are fine — each poll emits another partial
             // batch until `in_progress` is fully drained.
+
+            // TODO - this release the memory, we want to hold on that memory until
             last_batch = self.emit_in_progress_batch()?;
         }
 
+        // TODO - this has a bug that if the stream done but we passed the limit it would still emit
         if last_stream.is_done() || self.fetch.is_some_and(|fetch| fetch <= self.produced)
         {
             if let Some(last_batch) = last_batch.take() {
@@ -363,6 +365,7 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
             return Ok(());
         } else {
             // Undo the added produced batch since we did not emit it yes, so it will mess with coalesce limit
+            // TODO - this is ugly like that
             self.produced -= last_batch.as_ref().map(|x| x.num_rows()).unwrap_or(0);
         }
 
@@ -380,6 +383,7 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
             last_stream
         };
 
+        // TODO - add memory reservation once https://github.com/apache/datafusion/issues/23385 is resolved
         let mut coalescer = CoalesceBatchesStream::new(
             last_stream,
             self.batch_size,
