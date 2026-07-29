@@ -30,7 +30,7 @@ use crate::displayable;
 use crate::spill::get_record_batch_memory_size;
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
-use datafusion_common::{Result, exec_err};
+use datafusion_common::{exec_err, DataFusionError, Result, internal_err};
 use datafusion_common_runtime::JoinSet;
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryReservation;
@@ -443,6 +443,24 @@ impl<S> RecordBatchStreamAdapter<S> {
     /// let batch_stream: SendableRecordBatchStream = Box::pin(adapter);
     /// // ...
     /// ```
+    ///
+    /// For tests it is also useful to use this:
+    /// ```
+    /// # use arrow::array::record_batch;
+    /// # use datafusion_execution::SendableRecordBatchStream;
+    /// # use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+    /// // Create stream of Result<RecordBatch>
+    /// let batch = record_batch!(
+    ///     ("a", Int32, [1, 2, 3]),
+    ///     ("b", Float64, [Some(4.0), None, Some(5.0)])
+    /// )
+    /// .expect("created batch");
+    /// let adapter = RecordBatchStreamAdapter::<_>::try_from(vec![batch]).expect("must have non empty vec");
+    /// // Convert the stream to a SendableRecordBatchStream
+    /// // Now you can use the adapter as a SendableRecordBatchStream
+    /// let batch_stream: SendableRecordBatchStream = Box::pin(adapter);
+    /// // ...
+    /// ```
     pub fn new(schema: SchemaRef, stream: S) -> Self {
         Self {
             schema,
@@ -498,6 +516,22 @@ where
 {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+}
+
+type TryFromVecHelperFn = futures::stream::Iter<std::iter::Map<std::vec::IntoIter<RecordBatch>, fn(RecordBatch) -> std::result::Result<RecordBatch, DataFusionError>>>;
+
+impl TryFrom<Vec<RecordBatch>> for RecordBatchStreamAdapter<TryFromVecHelperFn> {
+    type Error = DataFusionError;
+
+    fn try_from(value: Vec<RecordBatch>) -> std::result::Result<Self, Self::Error> {
+        if value.is_empty() {
+            return internal_err!("must have at least 1 record batch to infer the stream schema from");
+        }
+        let schema = value[0].schema();
+        let stream = RecordBatchStreamAdapter::new(schema, futures::stream::iter(value.into_iter().map(Ok as fn(RecordBatch) -> std::result::Result<RecordBatch, DataFusionError>)));
+
+        Ok(stream)
     }
 }
 
@@ -815,6 +849,7 @@ impl RecordBatchStream for ReservationStream {
 
 #[cfg(test)]
 mod test {
+    use arrow::array::Int32Array;
     use super::*;
     use crate::test::exec::{
         BlockingExec, MockExec, PanicExec, assert_strong_count_converges_to_zero,
@@ -822,6 +857,7 @@ mod test {
 
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::exec_err;
+    use crate::common::collect;
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("a", DataType::Float32, true)]))
@@ -1159,5 +1195,44 @@ mod test {
             0,
             "Memory should be freed when stream is dropped"
         );
+    }
+
+    #[test]
+    fn should_return_error_when_trying_to_convert_empty_vec_to_stream_adapter() {
+        let v = Vec::<RecordBatch>::new();
+
+        let res: Result<RecordBatchStreamAdapter<_>> = v.try_into();
+        let err = res.unwrap_err();
+        match err {
+            DataFusionError::Internal(err) => {
+                assert!(err.contains("must have at least 1 record batch to infer the stream schema from"));
+            }
+            _ => panic!("Expected DataFusionError::Internal error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_be_able_to_convert_non_empty_vec_to_stream_adapter() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+        // Create a large batch that should be split
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from((0..10).collect::<Vec<_>>()))],
+        )
+          .unwrap();
+
+        let v = vec![batch.clone(), batch.clone(), batch.clone()];
+
+        let res = RecordBatchStreamAdapter::<_>::try_from(v).unwrap();
+        assert_eq!(res.schema(), schema, "should have the same schema");
+
+        let batch_stream = Box::pin(res) as SendableRecordBatchStream;
+        let results = collect(batch_stream).await.unwrap();
+
+        assert_eq!(results.len(), 3);
+        results.iter().for_each(|output_batch| {
+            assert_eq!(output_batch, &batch, "should have the same data");
+        })
     }
 }

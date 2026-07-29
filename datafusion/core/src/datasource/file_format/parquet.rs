@@ -1661,10 +1661,7 @@ mod tests {
         // write stream
         FileSink::write_all(
             parquet_sink.as_ref(),
-            Box::pin(RecordBatchStreamAdapter::new(
-                schema,
-                futures::stream::iter(vec![Ok(batch)]),
-            )),
+            Box::pin(RecordBatchStreamAdapter::try_from(vec![batch]).unwrap()),
             &build_ctx(object_store_url.as_ref()),
         )
         .await?;

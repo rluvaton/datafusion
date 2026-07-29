@@ -332,10 +332,8 @@ mod tests {
 
         let streams = (0..number_of_streams)
             .map(|_| {
-                Box::pin(RecordBatchStreamAdapter::new(
-                    Arc::clone(&schema),
-                    futures::stream::iter(vec![Ok(batch.clone())]),
-                )) as SendableRecordBatchStream
+                let stream = RecordBatchStreamAdapter::<_>::try_from(vec![batch.clone()]).unwrap();
+                Box::pin(stream) as SendableRecordBatchStream
             })
             .collect::<Vec<SendableRecordBatchStream>>();
 
