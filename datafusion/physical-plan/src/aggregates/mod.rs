@@ -7874,6 +7874,7 @@ mod tests {
                 EmitTo::First(_) => internal_err!(
                     "partial grouped aggregate output must materialize with EmitTo::All before slicing"
                 ),
+                EmitTo::NextBlock => unimplemented!(),
             }
         }
     }
