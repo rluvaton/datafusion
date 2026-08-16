@@ -523,12 +523,12 @@ impl HashJoinStream {
         join_type: JoinType,
         left_data: &JoinLeftData,
     ) -> HashJoinStreamState {
-        let build_empty = left_data.batch().num_rows() == 0;
+        let build_empty = !left_data.has_build_rows();
         // The map can be empty even when the build side has rows: under
         // `NullEqualsNothing`, build rows with a NULL join key are omitted. For
         // join types whose every output row requires a build match, that still
         // guarantees an empty result, so we can skip scanning the probe side.
-        let map_empty = left_data.map().is_empty();
+        let map_empty = !left_data.has_matchable_build_rows();
 
         if (build_empty && join_type.empty_build_side_produces_empty_result())
             || (map_empty && join_type.empty_map_produces_empty_result())
@@ -559,16 +559,24 @@ impl HashJoinStream {
             .bounds
             .clone()
             .unwrap_or_else(|| PartitionBounds::new(vec![]));
+        // Arrow tracks null counts per array, so this costs no data scan.
+        let keys_have_null = left_data
+            .values()
+            .iter()
+            .any(|array| array.null_count() > 0);
 
         let build_data = match self.mode {
             PartitionMode::Partitioned => PartitionBuildData::Partitioned {
                 partition_id: self.partition,
                 pushdown,
                 bounds,
+                keys_have_null,
             },
-            PartitionMode::CollectLeft => {
-                PartitionBuildData::CollectLeft { pushdown, bounds }
-            }
+            PartitionMode::CollectLeft => PartitionBuildData::CollectLeft {
+                pushdown,
+                bounds,
+                keys_have_null,
+            },
             PartitionMode::Auto => unreachable!(
                 "PartitionMode::Auto should not be present at execution time. This is a bug in DataFusion, please report it!"
             ),
@@ -779,7 +787,7 @@ impl HashJoinStream {
             }
         }
 
-        let is_empty = build_side.left_data.map().is_empty();
+        let is_empty = !build_side.left_data.has_matchable_build_rows();
 
         if is_empty {
             let result = build_batch_empty_build_side(
@@ -1075,6 +1083,7 @@ mod tests {
             partition_id,
             pushdown: PushdownStrategy::Empty,
             bounds: PartitionBounds::new(vec![]),
+            keys_have_null: false,
         }
     }
 

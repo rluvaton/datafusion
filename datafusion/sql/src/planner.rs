@@ -32,10 +32,10 @@ use datafusion_common::{
     DFSchemaRef, Diagnostic, SchemaError, field_not_found, internal_err,
     plan_datafusion_err,
 };
+use datafusion_expr::Expr;
 use datafusion_expr::logical_plan::{LogicalPlan, LogicalPlanBuilder};
 pub use datafusion_expr::planner::ContextProvider;
 use datafusion_expr::utils::find_column_exprs;
-use datafusion_expr::{Expr, col};
 use sqlparser::ast::{ArrayElemTypeDef, ExactNumberInfo, TimezoneInfo};
 use sqlparser::ast::{ColumnDef as SQLColumnDef, ColumnOption};
 use sqlparser::ast::{DataType as SQLDataType, Ident, ObjectName, TableAlias};
@@ -591,10 +591,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 idents.len()
             )
         } else {
-            let fields = plan.schema().fields().clone();
+            let columns = plan.schema().columns();
             LogicalPlanBuilder::from(plan)
-                .project(fields.iter().zip(idents).map(|(field, ident)| {
-                    col(field.name()).alias(self.ident_normalizer.normalize(ident))
+                .project(columns.into_iter().zip(idents).map(|(col, ident)| {
+                    Expr::Column(col).alias(self.ident_normalizer.normalize(ident))
                 }))?
                 .build()
         }
@@ -641,13 +641,13 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                             Diagnostic::new_error(
                                 format!(
                                     "column '{}' not found in '{}'",
-                                    &col.name, relation
+                                    col.name, relation
                                 ),
                                 col.spans().first(),
                             )
                         } else {
                             Diagnostic::new_error(
-                                format!("column '{}' not found", &col.name),
+                                format!("column '{}' not found", col.name),
                                 col.spans().first(),
                             )
                         };
@@ -826,6 +826,16 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     .collect::<Result<Vec<_>>>()?;
                 Ok(DataType::Struct(Fields::from(fields)))
             }
+            SQLDataType::Map(key_type, value_type) => {
+                let key_field = Arc::new(Field::new(
+                    "key", self.convert_data_type_to_field(key_type)?.data_type().clone(), false
+                ));
+                let value_field = Arc::new(Field::new(
+                    "value", self.convert_data_type_to_field(value_type)?.data_type().clone(), true)
+                );
+                let entries = DataType::Struct(Fields::from([key_field, value_field]));
+                Ok(DataType::Map(Arc::new(Field::new("entries", entries, false)), false))
+            }
             SQLDataType::Nvarchar(_)
             | SQLDataType::JSON
             | SQLDataType::Uuid
@@ -870,7 +880,6 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             | SQLDataType::Date32
             | SQLDataType::Datetime64(_, _)
             | SQLDataType::FixedString(_)
-            | SQLDataType::Map(_, _)
             | SQLDataType::Tuple(_)
             | SQLDataType::Nested(_)
             | SQLDataType::Union(_)
