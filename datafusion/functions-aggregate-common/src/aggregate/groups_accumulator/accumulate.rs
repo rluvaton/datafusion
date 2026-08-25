@@ -161,16 +161,16 @@ impl NullState {
     /// When value_fn is called it also sets
     ///
     /// 1. `self.seen_values[group_index]` to true for all rows that had a non null value
-    pub fn accumulate<T, F>(
+    pub fn accumulate<T, F, Index: Copy>(
         &mut self,
-        group_indices: &[usize],
+        group_indices: &[Index],
         values: &PrimitiveArray<T>,
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
         mut value_fn: F,
     ) where
         T: ArrowPrimitiveType + Send,
-        F: FnMut(usize, T::Native) + Send,
+        F: FnMut(Index, T::Native) + Send,
     {
         // skip null handling if no nulls in input or accumulator
         if let SeenValues::All { num_values } = &mut self.seen_values
@@ -199,15 +199,15 @@ impl NullState {
     ///
     /// See [`Self::accumulate`], which handles `PrimitiveArray`s, for
     /// more details on other arguments.
-    pub fn accumulate_boolean<F>(
+    pub fn accumulate_boolean<F, Index: Copy>(
         &mut self,
-        group_indices: &[usize],
+        group_indices: &[Index],
         values: &BooleanArray,
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
         mut value_fn: F,
     ) where
-        F: FnMut(usize, bool) + Send,
+        F: FnMut(Index, bool) + Send,
     {
         let data = values.values();
         assert_eq!(data.len(), group_indices.len());
@@ -370,14 +370,14 @@ impl NullState {
 /// value_fn(0, 200)
 /// value_fn(0, 300)
 /// ```
-pub fn accumulate<T, F>(
-    group_indices: &[usize],
+pub fn accumulate<T, F, Index>(
+    group_indices: &[Index],
     values: &PrimitiveArray<T>,
     opt_filter: Option<&BooleanArray>,
     mut value_fn: F,
 ) where
     T: ArrowPrimitiveType + Send,
-    F: FnMut(usize, T::Native) + Send,
+    F: FnMut(Index, T::Native) + Send,
 {
     let data: &[T::Native] = values.values();
     assert_eq!(data.len(), group_indices.len());
@@ -485,14 +485,14 @@ pub fn accumulate<T, F>(
 ///     * `group_idx`: The group index for the current row
 ///     * `batch_idx`: The index of the current row in the input arrays
 ///     * `columns`: Reference to all input arrays for accessing values
-pub fn accumulate_multiple<T, F>(
-    group_indices: &[usize],
+pub fn accumulate_multiple<T, F, Index>(
+    group_indices: &[Index],
     value_columns: &[&PrimitiveArray<T>],
     opt_filter: Option<&BooleanArray>,
     mut value_fn: F,
 ) where
     T: ArrowPrimitiveType + Send,
-    F: FnMut(usize, usize, &[&PrimitiveArray<T>]) + Send,
+    F: FnMut(Index, usize, &[&PrimitiveArray<T>]) + Send,
 {
     for col in value_columns.iter() {
         debug_assert_eq!(col.len(), group_indices.len());
@@ -541,13 +541,13 @@ pub fn accumulate_multiple<T, F>(
 ///
 /// See [`NullState::accumulate`], for more details on other
 /// arguments.
-pub fn accumulate_indices<F>(
-    group_indices: &[usize],
+pub fn accumulate_indices<F, Index>(
+    group_indices: &[Index],
     nulls: Option<&NullBuffer>,
     opt_filter: Option<&BooleanArray>,
     mut index_fn: F,
 ) where
-    F: FnMut(usize) + Send,
+    F: FnMut(Index) + Send,
 {
     match (nulls, opt_filter) {
         (None, None) => {
