@@ -47,7 +47,7 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedBooleanBuilder<FIXED_BLOCK_SIZING> {
     self.allocated_size
   }
 
-  pub(super) fn block_size(&self) -> usize {
+  pub fn block_size(&self) -> usize {
     assert!(FIXED_BLOCK_SIZING, "block size is only available for manual block");
     self.block_size
   }
