@@ -71,6 +71,8 @@ pub struct AccumulatorArgs<'a> {
 
     /// Fields corresponding to each expr (same order & length).
     pub expr_fields: &'a [FieldRef],
+
+    pub block_size: usize,
 }
 
 impl AccumulatorArgs<'_> {

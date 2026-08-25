@@ -40,9 +40,11 @@ use datafusion_expr::{
 
 use datafusion_doc::aggregate_doc_sections::DOC_SECTION_GENERAL;
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::prim_op::PrimitiveGroupsAccumulator;
+use datafusion_functions_aggregate_common::aggregate::groups_accumulator::blocked_prim_op::BlockedPrimitiveGroupsAccumulator;
 use datafusion_functions_aggregate_common::noop_accumulator::NoopAccumulator;
 use std::ops::{BitAndAssign, BitOrAssign, BitXorAssign};
 use std::sync::LazyLock;
+use datafusion_expr::groups_accumulator::BlockedGroupsAccumulator;
 
 /// This macro helps create group accumulators based on bitwise operations typically used internally
 /// and might not be necessary for users to call directly.
@@ -58,6 +60,25 @@ macro_rules! group_accumulator_helper {
             )),
             BitwiseOperationType::Xor => Ok(Box::new(
                 PrimitiveGroupsAccumulator::<$t, _>::new($dt, |x, y| x.bitxor_assign(y)),
+            )),
+        }
+    };
+}
+
+/// This macro helps create blocked group accumulators based on bitwise operations typically used internally
+/// and might not be necessary for users to call directly.
+macro_rules! blocked_group_accumulator_helper {
+    ($t:ty, $dt:expr, $opr:expr, $block_size:expr) => {
+        match $opr {
+            BitwiseOperationType::And => Ok(Box::new(
+                BlockedPrimitiveGroupsAccumulator::<$t, _>::new($dt, |x, y| x.bitand_assign(y), $block_size)
+                    .with_starting_value(!0),
+            )),
+            BitwiseOperationType::Or => Ok(Box::new(
+                BlockedPrimitiveGroupsAccumulator::<$t, _>::new($dt, |x, y| x.bitor_assign(y), $block_size),
+            )),
+            BitwiseOperationType::Xor => Ok(Box::new(
+                BlockedPrimitiveGroupsAccumulator::<$t, _>::new($dt, |x, y| x.bitxor_assign(y), $block_size),
             )),
         }
     };
@@ -308,6 +329,25 @@ impl AggregateUDFImpl for BitwiseOperation {
                 data_type
             ),
         }
+    }
+
+    fn blocked_groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
+        true
+    }
+
+    fn create_blocked_groups_accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn BlockedGroupsAccumulator>> {
+        let data_type = args.return_field.data_type();
+        let operation = &self.operation;
+        let block_size = args.block_size;
+        downcast_integer! {
+            data_type => (blocked_group_accumulator_helper, data_type, operation, block_size),
+            _ => not_impl_err!(
+                "BlockedGroupsAccumulator not supported for {} with {}",
+                self.name(),
+                data_type
+            ),
+        }
+
     }
 
     fn reverse_expr(&self) -> ReversedUDAF {

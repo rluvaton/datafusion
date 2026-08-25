@@ -103,6 +103,10 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider> Blocked
     self.len
   }
 
+  pub fn block_size(&self) -> usize {
+    self.block_size
+  }
+
   pub fn allocated_size(&self) -> usize {
     self.memory
   }

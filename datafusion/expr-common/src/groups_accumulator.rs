@@ -292,7 +292,7 @@ impl BlocksIndex {
 /// `BlocksGroupsAccumulator` implements a single aggregate (e.g. AVG) and
 /// stores the state for *all* groups internally in predefined blocks.
 ///
-/// Logically, a [`BlocksGroupsAccumulator`] stores a mapping from each group index to
+/// Logically, a [`BlockedGroupsAccumulator`] stores a mapping from each group index to
 /// the state of the aggregate for that group. For example an implementation for
 /// `min` might look like
 ///
@@ -341,7 +341,7 @@ impl BlocksIndex {
 ///
 /// [`Accumulator`]: crate::accumulator::Accumulator
 /// [Aggregating Millions of Groups Fast blog]: https://arrow.apache.org/blog/2023/08/05/datafusion_fast_grouping/
-pub trait BlocksGroupsAccumulator: Send + std::any::Any {
+pub trait BlockedGroupsAccumulator: Send + std::any::Any {
     /// Updates the accumulator's state from its arguments, encoded as
     /// a vector of [`ArrayRef`]s.
     ///

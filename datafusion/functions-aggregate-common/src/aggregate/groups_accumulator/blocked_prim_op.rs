@@ -24,7 +24,7 @@ use arrow::compute;
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::datatypes::DataType;
 use datafusion_common::{internal_datafusion_err, internal_err, DataFusionError, Result};
-use datafusion_expr_common::groups_accumulator::{BlocksGroupsAccumulator, BlocksIndex, EmitTo, GroupsAccumulator};
+use datafusion_expr_common::groups_accumulator::{BlockedGroupsAccumulator, BlocksIndex, EmitTo, GroupsAccumulator};
 use crate::blocked_helpers::BlockedVecBuilder;
 use super::accumulate::{BlockedNullState, NullState};
 
@@ -81,7 +81,7 @@ where
     }
 }
 
-impl<T, F> BlocksGroupsAccumulator for BlockedPrimitiveGroupsAccumulator<T, F>
+impl<T, F> BlockedGroupsAccumulator for BlockedPrimitiveGroupsAccumulator<T, F>
 where
     T: ArrowPrimitiveType + Send,
     F: Fn(&mut T::Native, T::Native) + Send + Sync + 'static,

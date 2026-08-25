@@ -21,7 +21,7 @@ use crate::aggregate::groups_accumulator::nulls::filtered_null_mask;
 use arrow::array::{ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder};
 use arrow::buffer::BooleanBuffer;
 use datafusion_common::{internal_err, Result};
-use datafusion_expr_common::groups_accumulator::{BlocksGroupsAccumulator, BlocksIndex, EmitTo, GroupsAccumulator};
+use datafusion_expr_common::groups_accumulator::{BlockedGroupsAccumulator, BlocksIndex, EmitTo, GroupsAccumulator};
 use crate::blocked_helpers::BlockedBooleanBuilder;
 use super::accumulate::{BlockedNullState, NullState};
 
@@ -67,7 +67,7 @@ where
     }
 }
 
-impl<F> BlocksGroupsAccumulator for BlockedBooleanGroupsAccumulator<F>
+impl<F> BlockedGroupsAccumulator for BlockedBooleanGroupsAccumulator<F>
 where
     F: Fn(bool, bool) -> bool + Send + Sync + 'static,
 {
