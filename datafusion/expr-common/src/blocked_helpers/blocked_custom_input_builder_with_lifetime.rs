@@ -8,6 +8,8 @@ pub trait BlockWithLifetimeProvider {
     type Block: BlockWithLifetime;
 
     fn new_block(&self) -> Self::Block;
+
+    fn allocated_size(&self) -> usize;
 }
 
 pub trait BlockProviderWithLifetimeFinish: BlockWithLifetimeProvider {
@@ -103,12 +105,16 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
     }
 
     pub fn allocated_size(&self) -> usize {
-        self.finished_blocks_allocated_memory + self.blocks.allocated_size() + self.blocks.back().map_or(0, |b| b.allocated_size())
+        self.blocks_provider.allocated_size() + self.finished_blocks_allocated_memory + self.blocks.allocated_size() + self.blocks.back().map_or(0, |b| b.allocated_size())
     }
 
     /// Get the number of elements in the current block (not the number of offsets since the first offset is always 0)
-    pub(crate) fn current_block_len(&self) -> usize {
+    pub fn current_block_len(&self) -> usize {
         self.blocks[self.current_block_index].len() - 1
+    }
+
+    pub fn current_block_index(&self) -> usize {
+        self.current_block_index
     }
 
     pub fn start_new_block(&mut self) {
@@ -374,8 +380,6 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
             assert_eq!(self.number_of_blocks, self.blocks.len());
         }
 
-        let prev_blocks_capacity = self.blocks.capacity();
-
         // TODO - set last offset, add empty block if now finished,
         // but avoid adding it if in last block so we won't get into infinite loop that we always insert one and we never have empty blocks to indicate end
         let block = self
@@ -423,5 +427,14 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
 
         let block = &self.blocks[block_index];
         block.index(item_index)
+    }
+
+    pub fn reset(&mut self) {
+        self.blocks = VecDeque::from(vec![self.blocks_provider.new_block()]);
+        self.len = 0;
+        self.current_block_index = 0;
+        self.number_of_blocks = 1;
+        self.pending_block = false;
+        self.finished_blocks_allocated_memory = 0;
     }
 }

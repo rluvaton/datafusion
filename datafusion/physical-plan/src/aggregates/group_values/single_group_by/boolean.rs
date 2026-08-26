@@ -23,17 +23,21 @@ use arrow::array::{
 use datafusion_common::Result;
 use datafusion_expr::EmitTo;
 use std::{mem::size_of, sync::Arc};
+use datafusion_expr_common::groups_accumulator::BlocksIndex;
 
 #[derive(Debug)]
 pub struct GroupValuesBoolean {
     false_group: Option<usize>,
     true_group: Option<usize>,
     null_group: Option<usize>,
+    block_size: usize,
 }
 
 impl GroupValuesBoolean {
-    pub fn new() -> Self {
+    pub fn new(block_size: usize) -> Self {
+        assert_ne!(block_size, 0);
         Self {
+            block_size,
             false_group: None,
             true_group: None,
             null_group: None,
@@ -42,7 +46,7 @@ impl GroupValuesBoolean {
 }
 
 impl GroupValues for GroupValuesBoolean {
-    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<BlocksIndex>) -> Result<()> {
         let array = cols[0].as_boolean();
         groups.clear();
 
@@ -77,7 +81,7 @@ impl GroupValues for GroupValuesBoolean {
                 }
             };
 
-            groups.push(index);
+            groups.push(BlocksIndex::from_index_in_fixed_block_size(index, self.block_size));
         }
 
         Ok(())
@@ -97,13 +101,61 @@ impl GroupValues for GroupValuesBoolean {
             + self.null_group.is_some() as usize
     }
 
-    fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+    // fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+    //     let len = self.len();
+    //     let mut builder = BooleanBufferBuilder::new(len);
+    //     let emit_count = match emit_to {
+    //         EmitTo::All => len,
+    //         EmitTo::First(n) => n,
+    //     };
+    //     builder.append_n(emit_count, false);
+    //     if let Some(idx) = self.true_group.as_mut() {
+    //         if *idx < emit_count {
+    //             builder.set_bit(*idx, true);
+    //             self.true_group = None;
+    //         } else {
+    //             *idx -= emit_count;
+    //         }
+    //     }
+    //
+    //     if let Some(idx) = self.false_group.as_mut() {
+    //         if *idx < emit_count {
+    //             // already false, no need to set
+    //             self.false_group = None;
+    //         } else {
+    //             *idx -= emit_count;
+    //         }
+    //     }
+    //
+    //     let values = builder.finish();
+    //
+    //     let nulls = if let Some(idx) = self.null_group.as_mut() {
+    //         if *idx < emit_count {
+    //             let mut buffer = NullBufferBuilder::new(len);
+    //             buffer.append_n_non_nulls(*idx);
+    //             buffer.append_null();
+    //             buffer.append_n_non_nulls(emit_count - *idx - 1);
+    //
+    //             self.null_group = None;
+    //             Some(buffer.finish().unwrap())
+    //         } else {
+    //             *idx -= emit_count;
+    //             None
+    //         }
+    //     } else {
+    //         None
+    //     };
+    //
+    //     Ok(vec![Arc::new(BooleanArray::new(values, nulls)) as _])
+    // }
+
+    fn emit_block(&mut self) -> Result<Option<Vec<ArrayRef>>> {
         let len = self.len();
+        if len == 0 {
+            return Ok(None);
+        }
         let mut builder = BooleanBufferBuilder::new(len);
-        let emit_count = match emit_to {
-            EmitTo::All => len,
-            EmitTo::First(n) => n,
-        };
+        let emit_count = self.block_size;
         builder.append_n(emit_count, false);
         if let Some(idx) = self.true_group.as_mut() {
             if *idx < emit_count {
@@ -142,7 +194,7 @@ impl GroupValues for GroupValuesBoolean {
             None
         };
 
-        Ok(vec![Arc::new(BooleanArray::new(values, nulls)) as _])
+        Ok(Some(vec![Arc::new(BooleanArray::new(values, nulls)) as _]))
     }
 
     fn clear_shrink(&mut self, _num_rows: usize) {

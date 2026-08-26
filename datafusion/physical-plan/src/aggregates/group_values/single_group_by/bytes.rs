@@ -22,7 +22,9 @@ use crate::aggregates::group_values::GroupValues;
 use arrow::array::{Array, ArrayRef, OffsetSizeTrait};
 use datafusion_common::Result;
 use datafusion_expr::EmitTo;
+use datafusion_expr_common::groups_accumulator::BlocksIndex;
 use datafusion_physical_expr_common::binary_map::{ArrowBytesMap, OutputType};
+use datafusion_physical_expr_common::blocked_binary_map::BlockedArrowBytesMap;
 
 /// A [`GroupValues`] storing single column of Utf8/LargeUtf8/Binary/LargeBinary values
 ///
@@ -30,22 +32,24 @@ use datafusion_physical_expr_common::binary_map::{ArrowBytesMap, OutputType};
 /// purpose `Row`s format
 pub struct GroupValuesBytes<O: OffsetSizeTrait> {
     /// Map string/binary values to group index
-    map: ArrowBytesMap<O, usize>,
+    map: BlockedArrowBytesMap<O, usize>,
     /// The total number of groups so far (used to assign group_index)
     num_groups: usize,
+    block_size: usize,
 }
 
 impl<O: OffsetSizeTrait> GroupValuesBytes<O> {
-    pub fn new(output_type: OutputType) -> Self {
+    pub fn new(output_type: OutputType, block_size: usize) -> Self {
         Self {
-            map: ArrowBytesMap::new(output_type),
+            map: BlockedArrowBytesMap::new(output_type, block_size),
             num_groups: 0,
+            block_size,
         }
     }
 }
 
 impl<O: OffsetSizeTrait> GroupValues for GroupValuesBytes<O> {
-    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<BlocksIndex>) -> Result<()> {
         assert_eq!(cols.len(), 1);
 
         // look up / add entries in the table
@@ -63,7 +67,7 @@ impl<O: OffsetSizeTrait> GroupValues for GroupValuesBytes<O> {
             },
             // called for each group
             |group_idx| {
-                groups.push(group_idx);
+                groups.push(BlocksIndex::from_index_in_fixed_block_size(group_idx, self.block_size));
             },
         );
 
@@ -84,40 +88,50 @@ impl<O: OffsetSizeTrait> GroupValues for GroupValuesBytes<O> {
         self.num_groups
     }
 
-    fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+    // fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+    //     // Reset the map to default, and convert it into a single array
+    //     let map_contents = self.map.take().into_state();
+    //
+    //     let group_values = match emit_to {
+    //         EmitTo::All => {
+    //             self.num_groups -= map_contents.len();
+    //             map_contents
+    //         }
+    //         EmitTo::First(n) if n == self.len() => {
+    //             self.num_groups -= map_contents.len();
+    //             map_contents
+    //         }
+    //         EmitTo::First(n) => {
+    //             // if we only wanted to take the first n, insert the rest back
+    //             // into the map we could potentially avoid this reallocation, at
+    //             // the expense of much more complex code.
+    //             // see https://github.com/apache/datafusion/issues/9195
+    //             let emit_group_values = map_contents.slice(0, n);
+    //             let remaining_group_values =
+    //               map_contents.slice(n, map_contents.len() - n);
+    //
+    //             self.num_groups = 0;
+    //             let mut group_indexes = vec![];
+    //             self.intern(&[remaining_group_values], &mut group_indexes)?;
+    //
+    //             // Verify that the group indexes were assigned in the correct order
+    //             assert_eq!(0, group_indexes[0]);
+    //
+    //             emit_group_values
+    //         }
+    //     };
+    //
+    //     Ok(vec![group_values])
+    // }
+
+    fn emit_block(&mut self) -> Result<Option<Vec<ArrayRef>>> {
         // Reset the map to default, and convert it into a single array
-        let map_contents = self.map.take().into_state();
-
-        let group_values = match emit_to {
-            EmitTo::All => {
-                self.num_groups -= map_contents.len();
-                map_contents
-            }
-            EmitTo::First(n) if n == self.len() => {
-                self.num_groups -= map_contents.len();
-                map_contents
-            }
-            EmitTo::First(n) => {
-                // if we only wanted to take the first n, insert the rest back
-                // into the map we could potentially avoid this reallocation, at
-                // the expense of much more complex code.
-                // see https://github.com/apache/datafusion/issues/9195
-                let emit_group_values = map_contents.slice(0, n);
-                let remaining_group_values =
-                    map_contents.slice(n, map_contents.len() - n);
-
-                self.num_groups = 0;
-                let mut group_indexes = vec![];
-                self.intern(&[remaining_group_values], &mut group_indexes)?;
-
-                // Verify that the group indexes were assigned in the correct order
-                assert_eq!(0, group_indexes[0]);
-
-                emit_group_values
-            }
+        let Some(map_contents) = self.map.take_block() else {
+            return Ok(None)
         };
+        self.num_groups -= map_contents.len();
 
-        Ok(vec![group_values])
+        Ok(Some(vec![map_contents]))
     }
 
     fn clear_shrink(&mut self, _num_rows: usize) {

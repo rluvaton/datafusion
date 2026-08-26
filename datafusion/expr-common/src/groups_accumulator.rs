@@ -19,6 +19,7 @@
 
 pub mod enumerate_blocked;
 
+use std::cmp::Ordering;
 use arrow::array::{ArrayRef, BooleanArray};
 use datafusion_common::{Result, utils::split_vec_min_alloc};
 
@@ -331,6 +332,45 @@ impl BlocksIndex {
     pub fn prev_mut_fixed(&mut self, block_size: usize) {
         self.block_index -= (self.index_in_block == 0) as usize;
         self.index_in_block = self.index_in_block.wrapping_sub(1).min(block_size - 1);
+    }
+
+    pub fn prev_block(&self) -> Self {
+        Self {
+            block_index: self.block_index - 1,
+            index_in_block: self.index_in_block
+        }
+    }
+
+    pub fn prev_block_saturate(&self) -> Self {
+        self.block_index.checked_sub(1).map_or_else(
+            || {
+                Self {
+                    block_index: 0,
+                    index_in_block: 0
+                }
+            },
+            |b| {
+            Self {
+                block_index: b,
+                index_in_block: self.index_in_block
+            }
+        })
+    }
+
+    pub fn prev_block_checked(&self) -> Option<Self> {
+        self.block_index.checked_sub(1).map(|b| {
+            Self {
+                block_index: b,
+                index_in_block: self.index_in_block
+            }
+        })
+    }
+}
+
+impl PartialOrd for BlocksIndex {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.block_index.partial_cmp(&other.block_index)
+          .map(|o| o.then(self.index_in_block.cmp(&other.index_in_block)))
     }
 }
 

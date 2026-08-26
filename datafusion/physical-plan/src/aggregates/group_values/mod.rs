@@ -27,6 +27,7 @@ use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion_common::Result;
 
 use datafusion_expr::EmitTo;
+use datafusion_expr_common::groups_accumulator::BlocksIndex;
 
 pub mod multi_group_by;
 
@@ -100,7 +101,7 @@ pub trait GroupValues: Send {
     /// If a row has the same value as a previous row, the same group id is
     /// assigned. If a row has a new value, the next available group id is
     /// assigned.
-    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()>;
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<BlocksIndex>) -> Result<()>;
 
     /// Returns the number of bytes of memory used by this [`GroupValues`].
     ///
@@ -114,7 +115,9 @@ pub trait GroupValues: Send {
     fn len(&self) -> usize;
 
     /// Emits the group values
-    fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>>;
+    // fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>>;
+
+    fn emit_block(&mut self) -> Result<Option<Vec<ArrayRef>>>;
 
     /// Clear the contents and shrink the capacity to the size of the batch (free up memory usage)
     fn clear_shrink(&mut self, num_rows: usize);
@@ -139,13 +142,14 @@ pub trait GroupValues: Send {
 pub fn new_group_values(
     schema: SchemaRef,
     group_ordering: &GroupOrdering,
+    block_size: usize,
 ) -> Result<Box<dyn GroupValues>> {
     if schema.fields.len() == 1 {
         let d = schema.fields[0].data_type();
 
         macro_rules! downcast_helper {
             ($t:ty, $d:ident) => {
-                return Ok(Box::new(GroupValuesPrimitive::<$t>::new($d.clone())))
+                return Ok(Box::new(GroupValuesPrimitive::<$t>::new($d.clone(), block_size)))
             };
         }
 
@@ -181,25 +185,25 @@ pub fn new_group_values(
                 downcast_helper!(Decimal128Type, d);
             }
             DataType::Utf8 => {
-                return Ok(Box::new(GroupValuesBytes::<i32>::new(OutputType::Utf8)));
+                return Ok(Box::new(GroupValuesBytes::<i32>::new(OutputType::Utf8, block_size)));
             }
             DataType::LargeUtf8 => {
-                return Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Utf8)));
+                return Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Utf8, block_size)));
             }
             DataType::Utf8View => {
-                return Ok(Box::new(GroupValuesBytesView::new(OutputType::Utf8View)));
+                return Ok(Box::new(GroupValuesBytesView::new(OutputType::Utf8View, block_size)));
             }
             DataType::Binary => {
-                return Ok(Box::new(GroupValuesBytes::<i32>::new(OutputType::Binary)));
+                return Ok(Box::new(GroupValuesBytes::<i32>::new(OutputType::Binary, block_size)));
             }
             DataType::LargeBinary => {
-                return Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Binary)));
+                return Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Binary, block_size)));
             }
             DataType::BinaryView => {
-                return Ok(Box::new(GroupValuesBytesView::new(OutputType::BinaryView)));
+                return Ok(Box::new(GroupValuesBytesView::new(OutputType::BinaryView, block_size)));
             }
             DataType::Boolean => {
-                return Ok(Box::new(GroupValuesBoolean::new()));
+                return Ok(Box::new(GroupValuesBoolean::new(block_size)));
             }
             _ => {}
         }
@@ -207,11 +211,11 @@ pub fn new_group_values(
 
     if multi_group_by::supported_schema(schema.as_ref()) {
         if matches!(group_ordering, GroupOrdering::None) {
-            Ok(Box::new(GroupValuesColumn::<false>::try_new(schema)?))
+            Ok(Box::new(GroupValuesColumn::<false>::try_new(schema, block_size)?))
         } else {
-            Ok(Box::new(GroupValuesColumn::<true>::try_new(schema)?))
+            Ok(Box::new(GroupValuesColumn::<true>::try_new(schema, block_size)?))
         }
     } else {
-        Ok(Box::new(GroupValuesRows::try_new(schema)?))
+        Ok(Box::new(GroupValuesRows::try_new(schema, block_size)?))
     }
 }

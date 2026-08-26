@@ -54,6 +54,10 @@ impl<T> BlockProvider for VecBlockProvider<T> {
     fn new_block(&self) -> Self::Block {
         vec![]
     }
+
+    fn allocated_size(&self) -> usize {
+        0
+    }
 }
 
 impl<T: ArrowNativeType> BlockProviderFinish for VecBlockProvider<T> {

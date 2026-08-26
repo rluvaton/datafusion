@@ -8,6 +8,8 @@ pub trait BlockProvider {
     type Block: Block;
 
     fn new_block(&self) -> Self::Block;
+
+    fn allocated_size(&self) -> usize;
 }
 
 pub trait BlockProviderFinish: BlockProvider {
@@ -106,12 +108,16 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
         self.len
     }
 
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
     pub fn block_size(&self) -> usize {
         self.block_size
     }
 
     pub fn allocated_size(&self) -> usize {
-        self.finished_blocks_allocated_memory + self.blocks.allocated_size() + self.blocks.back().map_or(0, |b| b.allocated_size())
+        self.blocks_provider.allocated_size() + self.finished_blocks_allocated_memory + self.blocks.allocated_size() + self.blocks.back().map_or(0, |b| b.allocated_size())
     }
 
     /// Get the number of elements in the current block (not the number of offsets since the first offset is always 0)

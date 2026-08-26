@@ -21,6 +21,8 @@ use datafusion_expr::EmitTo;
 use datafusion_physical_expr::binary_map::OutputType;
 use datafusion_physical_expr_common::binary_view_map::ArrowBytesViewMap;
 use std::mem::size_of;
+use datafusion_expr_common::groups_accumulator::BlocksIndex;
+use datafusion_physical_expr_common::blocked_binary_view_map::BlockedArrowBytesViewMap;
 
 /// A [`GroupValues`] storing single column of Utf8View/BinaryView values
 ///
@@ -28,16 +30,19 @@ use std::mem::size_of;
 /// purpose `Row`s format
 pub struct GroupValuesBytesView {
     /// Map string/binary values to group index
-    map: ArrowBytesViewMap<usize>,
+    map: BlockedArrowBytesViewMap<usize>,
     /// The total number of groups so far (used to assign group_index)
     num_groups: usize,
+
+    block_size: usize,
 }
 
 impl GroupValuesBytesView {
-    pub fn new(output_type: OutputType) -> Self {
+    pub fn new(output_type: OutputType, block_size: usize) -> Self {
         Self {
-            map: ArrowBytesViewMap::new(output_type),
+            map: BlockedArrowBytesViewMap::new(output_type, block_size),
             num_groups: 0,
+            block_size,
         }
     }
 }
@@ -46,7 +51,7 @@ impl GroupValues for GroupValuesBytesView {
     fn intern(
         &mut self,
         cols: &[ArrayRef],
-        groups: &mut Vec<usize>,
+        groups: &mut Vec<BlocksIndex>,
     ) -> datafusion_common::Result<()> {
         assert_eq!(cols.len(), 1);
 
@@ -65,7 +70,7 @@ impl GroupValues for GroupValuesBytesView {
             },
             // called for each group
             |group_idx| {
-                groups.push(group_idx);
+                groups.push(BlocksIndex::from_index_in_fixed_block_size(group_idx, self.block_size));
             },
         );
 
@@ -86,40 +91,15 @@ impl GroupValues for GroupValuesBytesView {
         self.num_groups
     }
 
-    fn emit(&mut self, emit_to: EmitTo) -> datafusion_common::Result<Vec<ArrayRef>> {
+    fn emit_block(&mut self) -> datafusion_common::Result<Option<Vec<ArrayRef>>> {
         // Reset the map to default, and convert it into a single array
-        let map_contents = self.map.take().into_state();
-
-        let group_values = match emit_to {
-            EmitTo::All => {
-                self.num_groups -= map_contents.len();
-                map_contents
-            }
-            EmitTo::First(n) if n == self.len() => {
-                self.num_groups -= map_contents.len();
-                map_contents
-            }
-            EmitTo::First(n) => {
-                // if we only wanted to take the first n, insert the rest back
-                // into the map we could potentially avoid this reallocation, at
-                // the expense of much more complex code.
-                // see https://github.com/apache/datafusion/issues/9195
-                let emit_group_values = map_contents.slice(0, n);
-                let remaining_group_values =
-                    map_contents.slice(n, map_contents.len() - n);
-
-                self.num_groups = 0;
-                let mut group_indexes = vec![];
-                self.intern(&[remaining_group_values], &mut group_indexes)?;
-
-                // Verify that the group indexes were assigned in the correct order
-                assert_eq!(0, group_indexes[0]);
-
-                emit_group_values
-            }
+        let Some(map_contents) = self.map.take_block() else {
+            return Ok(None)
         };
 
-        Ok(vec![group_values])
+        self.num_groups -= map_contents.len();
+
+        Ok(Some(vec![map_contents]))
     }
 
     fn clear_shrink(&mut self, _num_rows: usize) {

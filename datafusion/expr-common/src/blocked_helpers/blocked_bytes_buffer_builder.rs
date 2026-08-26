@@ -26,12 +26,19 @@ impl BlockedBytesBufferBuilder {
           self.blocks.allocated_size() + self.blocks.back().map_or(0, |b| b.allocated_size())
     }
 
-    pub fn current_block_len(&self) -> Option<usize> {
-        self.blocks.back().map(|block| block.len())
+    pub fn current_block_len(&self) -> usize {
+        self.blocks[self.blocks.len() - 1].len()
     }
 
     pub fn block(&self, block_index: usize) -> &Vec<u8> {
         &self.blocks[block_index]
+    }
+
+    pub fn reserve_bytes_in_current_block(&mut self, capacity: usize) {
+        let block = self.blocks.back_mut().unwrap();
+
+        // Not adding to finished blocks mem since it does not contain the last block
+        block.reserve(capacity);
     }
 
     pub(crate) fn reserve_blocks(&mut self, n: usize) {

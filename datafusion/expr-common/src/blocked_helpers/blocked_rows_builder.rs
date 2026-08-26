@@ -18,6 +18,10 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedRowsBuilder<FIXED_BLOCK_SIZING> {
             block_provider,
         ))
     }
+
+    pub fn row_converter(&self) -> &RowConverter {
+        self.0.provider().row_converter()
+    }
 }
 
 impl<const FIXED_BLOCK_SIZING: bool> Deref for BlockedRowsBuilder<FIXED_BLOCK_SIZING> {

@@ -34,6 +34,8 @@ use hashbrown::hash_table::HashTable;
 use log::debug;
 use std::mem::size_of;
 use std::sync::Arc;
+use datafusion_expr_common::blocked_helpers::BlockedRowsBuilder;
+use datafusion_expr_common::groups_accumulator::BlocksIndex;
 
 /// A [`GroupValues`] making use of [`Rows`]
 ///
@@ -47,8 +49,6 @@ pub struct GroupValuesRows {
     /// The output schema
     schema: SchemaRef,
 
-    /// Converter for the group values
-    row_converter: RowConverter,
 
     /// Logically maps group values to a group_index in
     /// [`Self::group_values`] and in each accumulator
@@ -58,7 +58,7 @@ pub struct GroupValuesRows {
     ///
     /// keys: u64 hashes of the GroupValue
     /// values: (hash, group_index)
-    map: HashTable<(u64, usize)>,
+    map: HashTable<(u64, BlocksIndex)>,
 
     /// The size of `map` in bytes
     map_size: usize,
@@ -71,7 +71,7 @@ pub struct GroupValuesRows {
     /// important for multi-column group keys.
     ///
     /// [`Row`]: arrow::row::Row
-    group_values: Option<Rows>,
+    group_values: BlockedRowsBuilder<true>,
 
     /// reused buffer to store hashes
     hashes_buffer: Vec<u64>,
@@ -81,13 +81,17 @@ pub struct GroupValuesRows {
 
     /// Random state for creating hashes
     random_state: RandomState,
+
+    block_size: usize,
 }
 
 impl GroupValuesRows {
-    pub fn try_new(schema: SchemaRef) -> Result<Self> {
+    pub fn try_new(schema: SchemaRef, block_size: usize) -> Result<Self> {
         // Print a debugging message, so it is clear when the (slower) fallback
         // GroupValuesRows is used.
         debug!("Creating GroupValuesRows for schema: {schema}");
+
+        assert_ne!(block_size, 0);
         let row_converter = RowConverter::new(
             schema
                 .fields()
@@ -104,20 +108,25 @@ impl GroupValuesRows {
         let rows_buffer =
             row_converter.empty_rows(starting_rows_capacity, starting_data_capacity);
         Ok(Self {
+            block_size,
             schema,
-            row_converter,
             map,
             map_size: 0,
-            group_values: None,
+            group_values: BlockedRowsBuilder::new(block_size, row_converter),
             hashes_buffer: Default::default(),
             rows_buffer,
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
         })
     }
+
+    /// Converter for the group values
+    fn row_converter(&self) -> &RowConverter {
+        self.group_values.row_converter()
+    }
 }
 
 impl GroupValues for GroupValuesRows {
-    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<BlocksIndex>) -> Result<()> {
         // Normalize -0.0 → +0.0 so RowConverter (IEEE 754 totalOrder) and
         // primitive hashing both group ±0 together. No-op for non-float
         // columns.
@@ -128,13 +137,9 @@ impl GroupValues for GroupValuesRows {
         // Convert the group keys into the row format
         let group_rows = &mut self.rows_buffer;
         group_rows.clear();
-        self.row_converter.append(group_rows, cols)?;
+        self.row_converter().append(group_rows, cols)?;
         let n_rows = group_rows.num_rows();
 
-        let mut group_values = match self.group_values.take() {
-            Some(group_values) => group_values,
-            None => self.row_converter.empty_rows(0, 0),
-        };
 
         // tracks to which group each of the input rows belongs
         groups.clear();
@@ -155,7 +160,7 @@ impl GroupValues for GroupValuesRows {
                     // verify that the group that we are inserting with hash is
                     // actually the same key value as the group in
                     // existing_idx  (aka group_values @ row)
-                    && group_rows.row(row) == group_values.row(*group_idx)
+                    && group_rows.row(row) == self.group_values.value(*group_idx)
             });
 
             let group_idx = match entry {
@@ -164,8 +169,8 @@ impl GroupValues for GroupValuesRows {
                 //  1.2 Need to create new entry for the group
                 None => {
                     // Add new entry to aggr_state and save newly created index
-                    let group_idx = group_values.num_rows();
-                    group_values.push(group_rows.row(row));
+                    let group_idx = BlocksIndex::new(self.group_values.current_block_index(), self.group_values.current_block_len());
+                    self.group_values.push(group_rows.row(row));
 
                     // for hasher function, use precomputed hash value
                     self.map.insert_accounted(
@@ -179,15 +184,11 @@ impl GroupValues for GroupValuesRows {
             groups.push(group_idx);
         }
 
-        self.group_values = Some(group_values);
-
         Ok(())
     }
 
     fn size(&self) -> usize {
-        let group_values_size = self.group_values.as_ref().map(|v| v.size()).unwrap_or(0);
-        self.row_converter.size()
-            + group_values_size
+        self.group_values.allocated_size()
             + self.map_size
             + self.rows_buffer.size()
             + self.hashes_buffer.allocated_size()
@@ -198,51 +199,83 @@ impl GroupValues for GroupValuesRows {
     }
 
     fn len(&self) -> usize {
-        self.group_values
-            .as_ref()
-            .map(|group_values| group_values.num_rows())
-            .unwrap_or(0)
+        self.group_values.len()
     }
 
-    fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        let mut group_values = self
-            .group_values
-            .take()
-            .expect("Can not emit from empty rows");
+    // fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+    //     let mut group_values = self
+    //       .group_values
+    //       .take()
+    //       .expect("Can not emit from empty rows");
+    //
+    //     let mut output = match emit_to {
+    //         EmitTo::All => {
+    //             let output = self.row_converter.convert_rows(&group_values)?;
+    //             group_values.clear();
+    //             self.map.clear();
+    //             output
+    //         }
+    //         EmitTo::First(n) => {
+    //             let groups_rows = group_values.iter().take(n);
+    //             let output = self.row_converter.convert_rows(groups_rows)?;
+    //             // Clear out first n group keys by copying them to a new Rows.
+    //             // TODO file some ticket in arrow-rs to make this more efficient?
+    //             let mut new_group_values = self.row_converter.empty_rows(0, 0);
+    //             for row in group_values.iter().skip(n) {
+    //                 new_group_values.push(row);
+    //             }
+    //             std::mem::swap(&mut new_group_values, &mut group_values);
+    //
+    //             self.map.retain(|(_exists_hash, group_idx)| {
+    //                 // Decrement group index by n
+    //                 match group_idx.checked_sub(n) {
+    //                     // Group index was >= n, shift value down
+    //                     Some(sub) => {
+    //                         *group_idx = sub;
+    //                         true
+    //                     }
+    //                     // Group index was < n, so remove from table
+    //                     None => false,
+    //                 }
+    //             });
+    //             output
+    //         }
+    //     };
+    //
+    //     // TODO: Materialize dictionaries in group keys
+    //     // https://github.com/apache/datafusion/issues/7647
+    //     for (field, array) in self.schema.fields.iter().zip(&mut output) {
+    //         let expected = field.data_type();
+    //         *array = encode_array_if_necessary(array, expected)?;
+    //     }
+    //
+    //     self.group_values = Some(group_values);
+    //     Ok(output)
+    // }
 
-        let mut output = match emit_to {
-            EmitTo::All => {
-                let output = self.row_converter.convert_rows(&group_values)?;
-                group_values.clear();
-                self.map.clear();
-                output
-            }
-            EmitTo::First(n) => {
-                let groups_rows = group_values.iter().take(n);
-                let output = self.row_converter.convert_rows(groups_rows)?;
-                // Clear out first n group keys by copying them to a new Rows.
-                // TODO file some ticket in arrow-rs to make this more efficient?
-                let mut new_group_values = self.row_converter.empty_rows(0, 0);
-                for row in group_values.iter().skip(n) {
-                    new_group_values.push(row);
-                }
-                std::mem::swap(&mut new_group_values, &mut group_values);
-
-                self.map.retain(|(_exists_hash, group_idx)| {
-                    // Decrement group index by n
-                    match group_idx.checked_sub(n) {
-                        // Group index was >= n, shift value down
-                        Some(sub) => {
-                            *group_idx = sub;
-                            true
-                        }
-                        // Group index was < n, so remove from table
-                        None => false,
-                    }
-                });
-                output
-            }
+    fn emit_block(&mut self) -> Result<Option<Vec<ArrayRef>>> {
+        let Some(block) = self.group_values.take_block() else {
+            return Ok(None);
         };
+
+        if self.group_values.len() == 0 {
+            self.map.clear();
+        } else {
+            self.map.retain(|(_exists_hash, group_idx)| {
+                // Decrement group index by n
+                match group_idx.prev_block_checked() {
+                    // Group index was >= n, shift value down
+                    Some(sub) => {
+                        *group_idx = sub;
+                        true
+                    }
+                    // Group index was < n, so remove from table
+                    None => false,
+                }
+            });
+        }
+
+        let mut output = self.row_converter().convert_rows(&block)?;
 
         // TODO: Materialize dictionaries in group keys
         // https://github.com/apache/datafusion/issues/7647
@@ -251,15 +284,11 @@ impl GroupValues for GroupValuesRows {
             *array = encode_array_if_necessary(array, expected)?;
         }
 
-        self.group_values = Some(group_values);
-        Ok(output)
+        Ok(Some(output))
     }
 
     fn clear_shrink(&mut self, num_rows: usize) {
-        self.group_values = self.group_values.take().map(|mut rows| {
-            rows.clear();
-            rows
-        });
+        self.group_values.reset();
         self.map.clear();
         self.map.shrink_to(num_rows, |_| 0); // hasher does not matter since the map is cleared
         self.map_size = self.map.capacity() * size_of::<(u64, usize)>();
