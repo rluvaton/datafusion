@@ -2,6 +2,7 @@ use crate::groups_accumulator::BlocksIndex;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::ops::{Index, IndexMut};
+use datafusion_common::utils::proxy::VecDequeAllocExt;
 
 pub trait BlockProvider {
     type Block: Block;
@@ -67,9 +68,7 @@ pub struct BlockedCustomInputBuilder<
 
     pending_block: bool,
 
-    /// TODO - only have allocated size for the finished blocks and compute the last block,
-    ///        to avoid code complexity and cost
-    memory: usize,
+    finished_blocks_allocated_memory: usize,
 }
 
 impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
@@ -83,8 +82,6 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
         }
 
         let blocks = VecDeque::from(vec![blocks_provider.new_block()]);
-        let memory = blocks.capacity() * size_of::<CustomBlockProvider::Block>()
-            + blocks[0].allocated_size();
         BlockedCustomInputBuilder {
             blocks_provider,
             blocks,
@@ -93,7 +90,7 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
             current_block_index: 0,
             number_of_blocks: 1,
             pending_block: false,
-            memory,
+            finished_blocks_allocated_memory: 0,
         }
     }
 
@@ -114,7 +111,7 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
     }
 
     pub fn allocated_size(&self) -> usize {
-        self.memory
+        self.finished_blocks_allocated_memory + self.blocks.allocated_size() + self.blocks.back().map_or(0, |b| b.allocated_size())
     }
 
     /// Get the number of elements in the current block (not the number of offsets since the first offset is always 0)
@@ -125,13 +122,9 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
     pub fn start_new_block(&mut self) {
         // Don't add to number of blocks since we might not insert into it
         self.current_block_index += 1;
-        let prev_capacity = self.blocks.capacity();
+        self.finished_blocks_allocated_memory += self.blocks.back().map_or(0, |b| b.allocated_size());
         let new_block = self.blocks_provider.new_block();
-        self.memory += new_block.allocated_size();
         self.blocks.push_back(new_block);
-        let new_capacity = self.blocks.capacity();
-        self.memory +=
-            (new_capacity - prev_capacity) * size_of::<CustomBlockProvider::Block>();
     }
 
     fn mark_as_having_value_in_block(&mut self) {
@@ -142,20 +135,14 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
     }
 
     pub(crate) fn reserve_blocks(&mut self, n: usize) {
-        let prev_capacity = self.blocks.capacity();
         self.blocks.reserve(n);
-
-        self.memory += (self.blocks.capacity() - prev_capacity)
-            * size_of::<CustomBlockProvider::Block>();
     }
 
     /// Push length and return if the current block is now full
     pub fn push(&mut self, value: <CustomBlockProvider::Block as Block>::Item) -> bool {
         let mut block = &mut self.blocks[self.current_block_index];
 
-        let before = block.allocated_size();
         block.push(value);
-        self.memory += (block.allocated_size() - before);
         self.len += 1;
 
         let finished_block = FIXED_BLOCK_SIZING && block.len() == self.block_size;
@@ -183,7 +170,6 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
         let mut block = &mut self.blocks[self.current_block_index];
 
         let prev_block_len = block.len();
-        let prev_block_capacity = block.allocated_size();
         block.extend(iter);
 
         if FIXED_BLOCK_SIZING {
@@ -194,8 +180,6 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
                 self.block_size
             );
         }
-
-        self.memory += (block.allocated_size() - prev_block_capacity);
 
         let added_items = block.len() - prev_block_len;
         self.len += added_items;
@@ -231,7 +215,6 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
         let mut block = &mut self.blocks[self.current_block_index];
 
         let prev_block_len = block.len();
-        let prev_block_size = block.allocated_size();
         block.extend_from_slice(slice);
 
         if FIXED_BLOCK_SIZING {
@@ -242,8 +225,6 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
                 self.block_size
             );
         }
-
-        self.memory += (block.allocated_size() - prev_block_size);
 
         let added_items = block.len() - prev_block_len;
         self.len += added_items;
@@ -314,8 +295,6 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
         self.len += n;
         let mut block = &mut self.blocks[self.current_block_index];
 
-        let prev_capacity = block.allocated_size();
-
         if FIXED_BLOCK_SIZING {
             let new_len = block.len() + n;
             assert!(
@@ -325,8 +304,6 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
             );
         }
         block.append_n(value, n);
-
-        self.memory += (block.allocated_size() - prev_capacity);
 
         let finished_block = FIXED_BLOCK_SIZING && block.len() == self.block_size;
 
@@ -397,18 +374,12 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
             assert_eq!(self.number_of_blocks, self.blocks.len());
         }
 
-        let prev_blocks_capacity = self.blocks.capacity();
-
         // TODO - set last offset, add empty block if now finished,
         // but avoid adding it if in last block so we won't get into infinite loop that we always insert one and we never have empty blocks to indicate end
         let block = self
             .blocks
             .pop_front()
             .expect("we verified that we have at least 1 block");
-
-        self.memory -= block.allocated_size();
-        self.memory -= (self.blocks.capacity() - prev_blocks_capacity)
-            * size_of::<CustomBlockProvider::Block>();
 
         self.number_of_blocks -= 1;
 
@@ -417,12 +388,15 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
             let prev_blocks_capacity = self.blocks.capacity();
 
             let block = self.blocks_provider.new_block();
-            self.memory += block.allocated_size();
+            self.finished_blocks_allocated_memory += block.allocated_size();
             self.blocks.push_back(block);
-            self.memory += (self.blocks.capacity() - prev_blocks_capacity)
+            self.finished_blocks_allocated_memory += (self.blocks.capacity() - prev_blocks_capacity)
                 * size_of::<CustomBlockProvider::Block>();
         } else {
             self.current_block_index -= 1;
+
+            // Only reduce memory if not the last one since the last block is calculated separately
+            self.finished_blocks_allocated_memory -= block.allocated_size();
         }
 
         let number_of_items = block.len() - 1;
@@ -448,8 +422,7 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
         self.current_block_index = 0;
         self.number_of_blocks = 1;
         self.pending_block = false;
-        self.memory = self.blocks.capacity() * size_of::<CustomBlockProvider::Block>()
-            + self.blocks[0].allocated_size();
+        self.finished_blocks_allocated_memory = 0;
     }
 }
 

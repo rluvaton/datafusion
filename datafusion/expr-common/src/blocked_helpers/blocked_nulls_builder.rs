@@ -1,6 +1,7 @@
+use crate::groups_accumulator::BlocksIndex;
 use arrow::array::NullBufferBuilder;
 use arrow::buffer::NullBuffer;
-use crate::groups_accumulator::BlocksIndex;
+use datafusion_common::utils::proxy::VecDequeAllocExt;
 use std::collections::VecDeque;
 use std::ops::Index;
 
@@ -17,7 +18,7 @@ pub struct BlockedNullsBuilder<const FIXED_BLOCK_SIZING: bool> {
 
     len: usize,
 
-    allocated_size: usize,
+    finished_blocks_allocated_size: usize,
 
     might_have_nulls: bool,
 }
@@ -30,15 +31,12 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
 
         let blocks = VecDeque::from(vec![NullBufferBuilder::new(block_size)]);
 
-        let allocated_size = blocks.capacity() * size_of::<NullBufferBuilder>()
-            + blocks[0].allocated_size();
-
         BlockedNullsBuilder {
             blocks,
             block_size,
             current_block_index: 0,
             len: 0,
-            allocated_size,
+            finished_blocks_allocated_size: 0,
             might_have_nulls: false,
         }
     }
@@ -48,7 +46,9 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
     }
 
     pub fn allocated_size(&self) -> usize {
-        self.allocated_size
+        self.finished_blocks_allocated_size
+            + self.blocks.allocated_size()
+            + self.blocks.back().map_or(0, |b| b.allocated_size())
     }
 
     pub(super) fn block_size(&self) -> usize {
@@ -65,19 +65,14 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
 
     pub fn start_new_block(&mut self) {
         self.current_block_index += 1;
-        let capacity_before = self.blocks.capacity();
+        self.finished_blocks_allocated_size +=
+            self.blocks.back().map_or(0, |b| b.allocated_size());
         let new_block = NullBufferBuilder::new(self.block_size);
-        self.allocated_size += new_block.allocated_size();
         self.blocks.push_back(new_block);
-        self.allocated_size +=
-            (self.blocks.capacity() - capacity_before) * size_of::<NullBufferBuilder>();
     }
 
     pub(crate) fn reserve_blocks(&mut self, n: usize) {
-        let capacity_before = self.blocks.capacity();
         self.blocks.reserve(n);
-        self.allocated_size +=
-            (self.blocks.capacity() - capacity_before) * size_of::<NullBufferBuilder>();
     }
 
     /// Extend the null buffer
@@ -103,12 +98,8 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
         let block = &mut self.blocks[self.current_block_index];
         let prev_block_size = block.len();
 
-        let size_before = block.allocated_size();
-
         // Do fast large copy
         block.append_buffer(null_buffer);
-
-        self.allocated_size += (block.allocated_size() - size_before);
 
         let added_items = block.len() - prev_block_size;
 
@@ -184,14 +175,11 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
         let block = &mut self.blocks[self.current_block_index];
         let prev_block_size = block.len();
 
-        let size_before = block.allocated_size();
-
         // TODO - reserve in block and set each byte without extra checks
         for &index_to_copy in indexes {
             block.append(null_buffer.is_valid(index_to_copy));
         }
 
-        self.allocated_size += (block.allocated_size() - size_before);
         let added_items = block.len() - prev_block_size;
 
         self.len += added_items;
@@ -251,16 +239,12 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
         self.len += n;
         let mut block = &mut self.blocks[self.current_block_index];
 
-        let size_before = block.allocated_size();
-
         if is_valid {
             block.append_n_non_nulls(n)
         } else {
             block.append_n_nulls(n);
             self.might_have_nulls = true;
         }
-
-        self.allocated_size += (block.allocated_size() - size_before);
 
         assert!(
             block.len() <= self.block_size,
@@ -306,9 +290,7 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
     pub fn push_non_null(&mut self) {
         let mut block = &mut self.blocks[self.current_block_index];
 
-        let mem_before = block.allocated_size();
         block.append_non_null();
-        self.allocated_size += (block.allocated_size() - mem_before);
         self.len += 1;
 
         self.might_have_nulls |= block.as_slice().is_some();
@@ -321,9 +303,7 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
     pub fn push_null(&mut self) {
         let mut block = &mut self.blocks[self.current_block_index];
 
-        let mem_before = block.allocated_size();
         block.append_null();
-        self.allocated_size += (block.allocated_size() - mem_before);
         self.len += 1;
 
         self.might_have_nulls = true;
@@ -350,13 +330,10 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
 
         let prev_block_len = block.len();
 
-        let mem_before = block.allocated_size();
-
         for is_valid in iter {
             block.append(is_valid);
         }
 
-        self.allocated_size += (block.allocated_size() - mem_before);
         assert!(
             block.len() <= self.block_size,
             "overflow from block new block length: {}, block size: {}",
@@ -378,9 +355,6 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
     pub fn take_block(&mut self) -> Option<Option<NullBuffer>> {
         let capacity_before = self.blocks.capacity();
         let mut block = self.blocks.pop_front()?;
-        self.allocated_size -=
-            (capacity_before - self.blocks.capacity()) * size_of::<NullBufferBuilder>();
-        self.allocated_size -= block.allocated_size();
         let number_of_items = block.len() - 1;
         self.len -= number_of_items;
 
@@ -388,12 +362,10 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
         if self.blocks.is_empty() {
             self.might_have_nulls = false;
             let empty_block = NullBufferBuilder::new(self.block_size);
-            self.allocated_size += empty_block.allocated_size();
-            let capacity_before = self.blocks.capacity();
             self.blocks.push_back(empty_block);
-
-            self.allocated_size += (self.blocks.capacity() - capacity_before)
-                * size_of::<NullBufferBuilder>();
+        } else {
+            // Only reduce memory if not the last one since the last block is calculated separately
+            self.finished_blocks_allocated_size -= block.allocated_size();
         }
 
         Some(block.build().filter(|b| b.null_count() > 0))
