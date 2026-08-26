@@ -1,49 +1,47 @@
-use datafusion_expr_common::groups_accumulator::BlocksIndex;
+use crate::groups_accumulator::BlocksIndex;
 use std::collections::VecDeque;
 use std::fmt::Debug;
-use std::ops::Index;
+use std::ops::{Index, IndexMut};
 
-pub trait BlockWithLifetimeProvider {
-    type Block: BlockWithLifetime;
+pub trait BlockProvider {
+    type Block: Block;
 
     fn new_block(&self) -> Self::Block;
 }
 
-pub trait BlockProviderWithLifetimeFinish: BlockWithLifetimeProvider {
+pub trait BlockProviderFinish: BlockProvider {
     type FinishedBlock;
 
     fn finish(&self, block: Self::Block) -> Self::FinishedBlock;
 }
 
-pub trait BlockWithLifetime {
-    type Item<'a>;
+pub trait Block {
+    type Item;
 
     /// Get allocated bytes on heap (not including `size_of::<Self>()`)
     fn allocated_size(&self) -> usize;
 
-    fn push(&mut self, item: Self::Item<'_>);
+    fn push(&mut self, item: Self::Item);
 
-    fn extend<'a>(&mut self, iter: impl Iterator<Item = Self::Item<'a>>);
+    fn extend(&mut self, iter: impl Iterator<Item = Self::Item>);
 
     /// Number of items in the block
     fn len(&self) -> usize;
 
     fn is_empty(&self) -> bool;
-
-    fn index<'a>(&'a self, index: usize) -> Self::Item<'a>;
 }
 
-pub trait BlockWithLifetimeWithSlice: BlockWithLifetime {
-    fn extend_from_slice(&mut self, slice: &[Self::Item<'_>]);
-    fn append_n(&mut self, item: Self::Item<'_>, n: usize);
+pub trait BlockWithSlice: Block {
+    fn extend_from_slice(&mut self, slice: &[Self::Item]);
+    fn append_n(&mut self, item: Self::Item, n: usize);
 }
 
 /// When `FIXED_BLOCK_SIZING` is true, the block size is the `Self::block_size` otherwise,
 /// the callers control the block size
 #[derive(Debug)]
-pub struct BlockedCustomInputBuilderWithLifetime<
+pub struct BlockedCustomInputBuilder<
     const FIXED_BLOCK_SIZING: bool,
-    CustomBlockProvider: BlockWithLifetimeProvider,
+    CustomBlockProvider: BlockProvider,
 > {
     blocks_provider: CustomBlockProvider,
     /// Using `VecDeque` so we can remove the first block and reclaim memory
@@ -74,9 +72,11 @@ pub struct BlockedCustomInputBuilderWithLifetime<
     memory: usize,
 }
 
-impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvider>
-    BlockedCustomInputBuilderWithLifetime<FIXED_BLOCK_SIZING, CustomBlockProvider>
+impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
+    BlockedCustomInputBuilder<FIXED_BLOCK_SIZING, CustomBlockProvider>
 {
+    // TODO - some want to preallocate the blocks and some don't,
+    //        there should be a way while avoiding having a lot of memory used if all are prealocatting
     pub fn new(block_size: usize, blocks_provider: CustomBlockProvider) -> Self {
         if FIXED_BLOCK_SIZING {
             assert_ne!(block_size, 0, "block size must be greater than 0");
@@ -85,7 +85,7 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
         let blocks = VecDeque::from(vec![blocks_provider.new_block()]);
         let memory = blocks.capacity() * size_of::<CustomBlockProvider::Block>()
             + blocks[0].allocated_size();
-        BlockedCustomInputBuilderWithLifetime {
+        BlockedCustomInputBuilder {
             blocks_provider,
             blocks,
             block_size,
@@ -97,12 +97,20 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
         }
     }
 
-    pub fn provider(&self) -> &CustomBlockProvider {
+    pub fn blocks_provider(&self) -> &CustomBlockProvider {
         &self.blocks_provider
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.block_size
     }
 
     pub fn allocated_size(&self) -> usize {
@@ -110,7 +118,7 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
     }
 
     /// Get the number of elements in the current block (not the number of offsets since the first offset is always 0)
-    pub(crate) fn current_block_len(&self) -> usize {
+    pub fn current_block_len(&self) -> usize {
         self.blocks[self.current_block_index].len() - 1
     }
 
@@ -142,10 +150,7 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
     }
 
     /// Push length and return if the current block is now full
-    pub fn push(
-        &mut self,
-        value: <CustomBlockProvider::Block as BlockWithLifetime>::Item<'_>,
-    ) -> bool {
+    pub fn push(&mut self, value: <CustomBlockProvider::Block as Block>::Item) -> bool {
         let mut block = &mut self.blocks[self.current_block_index];
 
         let before = block.allocated_size();
@@ -170,11 +175,9 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
     ///
     /// # Panics
     /// Panics if the iterator length exceeds the remaining size of the current block
-    pub(super) fn extend_in_block<'a>(
+    pub(super) fn extend_in_block(
         &mut self,
-        iter: impl Iterator<
-            Item = <CustomBlockProvider::Block as BlockWithLifetime>::Item<'a>,
-        > + 'a,
+        iter: impl Iterator<Item = <CustomBlockProvider::Block as Block>::Item>,
         should_mark_empty: bool,
     ) -> bool {
         let mut block = &mut self.blocks[self.current_block_index];
@@ -220,10 +223,10 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
     /// Panics if the iterator length exceeds the remaining size of the current block
     pub(super) fn extend_from_slice_in_block(
         &mut self,
-        slice: &[<CustomBlockProvider::Block as BlockWithLifetime>::Item<'_>],
+        slice: &[<CustomBlockProvider::Block as Block>::Item],
     ) -> bool
     where
-        CustomBlockProvider::Block: BlockWithLifetimeWithSlice,
+        CustomBlockProvider::Block: BlockWithSlice,
     {
         let mut block = &mut self.blocks[self.current_block_index];
 
@@ -264,9 +267,9 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
     /// Extend the length from the current offsets
     pub fn extend_from_slice(
         &mut self,
-        mut buffer: &[<CustomBlockProvider::Block as BlockWithLifetime>::Item<'_>],
+        mut buffer: &[<CustomBlockProvider::Block as Block>::Item],
     ) where
-        CustomBlockProvider::Block: BlockWithLifetimeWithSlice,
+        CustomBlockProvider::Block: BlockWithSlice,
     {
         // If not fixed, then treat all offsets as single block
         if !FIXED_BLOCK_SIZING {
@@ -302,11 +305,11 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
 
     pub(crate) fn push_value_n_within_block(
         &mut self,
-        value: <CustomBlockProvider::Block as BlockWithLifetime>::Item<'_>,
+        value: <CustomBlockProvider::Block as Block>::Item,
         n: usize,
     ) -> bool
     where
-        CustomBlockProvider::Block: BlockWithLifetimeWithSlice,
+        CustomBlockProvider::Block: BlockWithSlice,
     {
         self.len += n;
         let mut block = &mut self.blocks[self.current_block_index];
@@ -340,24 +343,21 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
     }
 
     /// Push default
-    pub fn push_default_n<'a>(&mut self, n: usize)
+    pub fn push_default_n(&mut self, n: usize)
     where
-        CustomBlockProvider::Block: BlockWithLifetimeWithSlice,
-        <CustomBlockProvider::Block as BlockWithLifetime>::Item<'a>: Default + Copy,
+        CustomBlockProvider::Block: BlockWithSlice,
+        <CustomBlockProvider::Block as Block>::Item: Default + Clone,
     {
-        self.push_value_n(
-            <CustomBlockProvider::Block as BlockWithLifetime>::Item::default(),
-            n,
-        );
+        self.push_value_n(<CustomBlockProvider::Block as Block>::Item::default(), n);
     }
 
-    pub fn push_value_n<'a>(
+    pub fn push_value_n(
         &mut self,
-        value: <CustomBlockProvider::Block as BlockWithLifetime>::Item<'a>,
+        value: <CustomBlockProvider::Block as Block>::Item,
         mut n: usize,
     ) where
-        CustomBlockProvider::Block: BlockWithLifetimeWithSlice,
-        <CustomBlockProvider::Block as BlockWithLifetime>::Item<'a>: Copy,
+        CustomBlockProvider::Block: BlockWithSlice,
+        <CustomBlockProvider::Block as Block>::Item: Clone,
     {
         // If not fixed, then treat all offsets as single block
         if !FIXED_BLOCK_SIZING {
@@ -376,7 +376,7 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
             let to_add = remaining_in_current_block.min(n);
             n -= to_add;
 
-            self.push_value_n_within_block(value, to_add);
+            self.push_value_n_within_block(value.clone(), to_add);
         }
     }
 
@@ -433,7 +433,7 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
 
     pub fn take_block_finished(&mut self) -> Option<CustomBlockProvider::FinishedBlock>
     where
-        CustomBlockProvider: BlockProviderWithLifetimeFinish,
+        CustomBlockProvider: BlockProviderFinish,
     {
         let block = self.take_block()?;
 
@@ -442,14 +442,105 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockWithLifetimeProvi
         Some(finished)
     }
 
-    pub fn value(
-        &self,
-        index: BlocksIndex,
-    ) -> <CustomBlockProvider::Block as BlockWithLifetime>::Item<'_> {
-        let block_index = index.block_index();
-        let item_index = index.index_in_block();
+    pub fn reset(&mut self) {
+        self.blocks = VecDeque::from(vec![self.blocks_provider.new_block()]);
+        self.len = 0;
+        self.current_block_index = 0;
+        self.number_of_blocks = 1;
+        self.pending_block = false;
+        self.memory = self.blocks.capacity() * size_of::<CustomBlockProvider::Block>()
+            + self.blocks[0].allocated_size();
+    }
+}
 
-        let block = &self.blocks[block_index];
-        block.index(item_index)
+impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
+    Extend<<CustomBlockProvider::Block as Block>::Item>
+    for BlockedCustomInputBuilder<FIXED_BLOCK_SIZING, CustomBlockProvider>
+{
+    fn extend<T: IntoIterator<Item = <CustomBlockProvider::Block as Block>::Item>>(
+        &mut self,
+        iter: T,
+    ) {
+        if !FIXED_BLOCK_SIZING {
+            self.extend_in_block(iter.into_iter(), true);
+
+            return;
+        }
+
+        let mut iter = iter.into_iter();
+
+        let mut is_first = true;
+        loop {
+            let remaining_in_current_block = self.current_block_remaining_len();
+            let block_finished = self.extend_in_block(
+                iter.by_ref().take(remaining_in_current_block),
+                is_first,
+            );
+
+            is_first = false;
+            if !block_finished {
+                break;
+            }
+        }
+    }
+}
+
+impl<CustomBlockProvider> Index<usize>
+    for BlockedCustomInputBuilder<true, CustomBlockProvider>
+where
+    CustomBlockProvider: BlockProvider,
+    CustomBlockProvider::Block:
+        Index<usize, Output = <CustomBlockProvider::Block as Block>::Item>,
+{
+    type Output = <CustomBlockProvider::Block as Block>::Item;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.index(BlocksIndex::from_index_in_fixed_block_size(
+            index,
+            self.block_size,
+        ))
+    }
+}
+
+impl<CustomBlockProvider> IndexMut<usize>
+    for BlockedCustomInputBuilder<true, CustomBlockProvider>
+where
+    CustomBlockProvider: BlockProvider,
+    CustomBlockProvider::Block:
+        IndexMut<usize, Output = <CustomBlockProvider::Block as Block>::Item>,
+{
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        self.index_mut(BlocksIndex::from_index_in_fixed_block_size(
+            index,
+            self.block_size,
+        ))
+    }
+}
+
+impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider> Index<BlocksIndex>
+    for BlockedCustomInputBuilder<FIXED_BLOCK_SIZING, CustomBlockProvider>
+where
+    CustomBlockProvider: BlockProvider,
+    CustomBlockProvider::Block:
+        Index<usize, Output = <CustomBlockProvider::Block as Block>::Item>,
+{
+    type Output = <CustomBlockProvider::Block as Block>::Item;
+
+    fn index(&self, index: BlocksIndex) -> &Self::Output {
+        &self.blocks[index.block_index()][index.index_in_block()]
+    }
+}
+
+impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider> IndexMut<BlocksIndex>
+    for BlockedCustomInputBuilder<FIXED_BLOCK_SIZING, CustomBlockProvider>
+where
+    CustomBlockProvider: BlockProvider,
+    CustomBlockProvider::Block:
+        Index<usize, Output = <CustomBlockProvider::Block as Block>::Item>,
+    CustomBlockProvider::Block:
+        IndexMut<usize, Output = <CustomBlockProvider::Block as Block>::Item>,
+{
+    fn index_mut(&mut self, index: BlocksIndex) -> &mut Self::Output {
+        &mut self.blocks[index.block_index()][index.index_in_block()]
     }
 }

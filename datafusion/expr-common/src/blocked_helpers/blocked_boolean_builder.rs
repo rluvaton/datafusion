@@ -1,6 +1,6 @@
 use arrow::array::BooleanBufferBuilder;
 use arrow::buffer::{BooleanBuffer, NullBuffer};
-use datafusion_expr_common::groups_accumulator::BlocksIndex;
+use crate::groups_accumulator::BlocksIndex;
 use std::collections::VecDeque;
 use std::ops::Index;
 

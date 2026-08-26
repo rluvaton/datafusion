@@ -1,22 +1,20 @@
-use crate::aggregate::groups_accumulator::VecAllocExt;
 use arrow::array::OffsetSizeTrait;
 use arrow::buffer::Buffer;
 use std::collections::VecDeque;
+use datafusion_common::utils::proxy::{VecAllocExt, VecDequeAllocExt};
 
 #[derive(Debug)]
 pub struct BlockedBytesBufferBuilder {
     /// Using `VecDeque` so we can remove the first block and reclaim memory
     blocks: VecDeque<Vec<u8>>,
 
-    memory: usize,
+    finished_blocks_mem: usize,
 }
 
 impl BlockedBytesBufferBuilder {
     pub fn new() -> Self {
         let blocks = VecDeque::from(vec![vec![]]);
-        let memory =
-            blocks.capacity() * size_of::<Vec<u8>>() + blocks[0].allocated_size();
-        BlockedBytesBufferBuilder { blocks, memory }
+        BlockedBytesBufferBuilder { blocks, finished_blocks_mem: 0 }
     }
 
     pub fn num_blocks(&self) -> usize {
@@ -24,7 +22,8 @@ impl BlockedBytesBufferBuilder {
     }
 
     pub fn allocated_size(&self) -> usize {
-        self.memory
+        self.finished_blocks_mem +
+          self.blocks.allocated_size() + self.blocks.back().map_or(0, |b| b.allocated_size())
     }
 
     pub fn current_block_len(&self) -> Option<usize> {
@@ -36,29 +35,24 @@ impl BlockedBytesBufferBuilder {
     }
 
     pub(crate) fn reserve_blocks(&mut self, n: usize) {
-        let before = self.blocks.capacity();
         self.blocks.reserve(n);
-        self.memory += (self.blocks.capacity() - before) * size_of::<Vec<u8>>();
     }
 
     pub fn start_new_block(&mut self) {
+        self.finished_blocks_mem += self.blocks.back().map_or(0, |b| b.allocated_size());
         self.blocks.push_back(vec![]);
     }
 
     pub fn extend_from_slice(&mut self, slice: &[u8]) {
         let block = &mut self.blocks.back_mut().unwrap();
 
-        let before = block.capacity();
         block.extend_from_slice(slice);
-        self.memory += (block.capacity() - before);
     }
 
     pub(crate) fn reserve_capacity_in_current_block(&mut self, capacity: usize) {
         let block = self.blocks.back_mut().unwrap();
 
-        let before = block.capacity();
         block.reserve(capacity);
-        self.memory += (block.capacity() - before);
     }
 
     /// Extend the bytes at the provided offsets
@@ -72,37 +66,28 @@ impl BlockedBytesBufferBuilder {
     ) {
         let block = self.blocks.back_mut().unwrap();
 
-        let before = block.capacity();
-
         for &index_to_copy in indexes {
             let from = offset_buffer_slice[index_to_copy - 1].as_usize();
             let to = offset_buffer_slice[index_to_copy].as_usize();
 
             block.extend_from_slice(&bytes[from..to]);
         }
-
-        self.memory += (block.capacity() - before);
     }
 
     pub fn take_block(&mut self) -> Option<Vec<u8>> {
-        let before = self.blocks.capacity();
         let current_block = self.blocks.pop_front();
-        self.memory -= (self.blocks.capacity() - before) * size_of::<Vec<u8>>();
-        self.memory -= current_block
-            .as_ref()
-            .map(|block| block.capacity())
-            .unwrap_or(0);
 
         // TODO - this will create infinite loop that take_block will never return None
         //        but we still need to have a new empty block for next emit
         if self.blocks.is_empty() {
-            let empty: Vec<u8> = vec![];
-            self.memory += empty.capacity();
-            let before = self.blocks.capacity();
             // Add a new empty block for next emit
             self.blocks.push_back(vec![]);
-
-            self.memory += (self.blocks.capacity() - before) * size_of::<Vec<u8>>();
+        } else {
+            // Only if not the last block since the current block is being calculated separately
+            self.finished_blocks_mem -= current_block
+              .as_ref()
+              .map(|block| block.capacity())
+              .unwrap_or(0);
         }
 
         current_block
@@ -122,6 +107,6 @@ impl<'a> Extend<&'a [u8]> for BlockedBytesBufferBuilder {
             block.extend_from_slice(slice);
         }
 
-        self.memory += (block.capacity() - before);
+        self.finished_blocks_mem += (block.capacity() - before);
     }
 }

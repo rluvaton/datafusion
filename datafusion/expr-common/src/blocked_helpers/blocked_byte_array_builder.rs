@@ -4,7 +4,7 @@ use super::blocked_offset_buffer_builder::BlockedOffsetBufferBuilder;
 use arrow::array::{Array, GenericByteArray, OffsetSizeTrait};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{ArrowNativeType, ByteArrayType};
-use datafusion_expr_common::groups_accumulator::BlocksIndex;
+use crate::groups_accumulator::BlocksIndex;
 use std::collections::VecDeque;
 use std::ops::{Deref, Index};
 

@@ -2186,6 +2186,7 @@ version = "55.0.0"
 dependencies = [
  "arrow",
  "datafusion-common",
+ "hashbrown 0.17.1",
  "indexmap 2.14.0",
  "insta",
  "itertools 0.15.0",
@@ -2293,7 +2294,6 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr-common",
  "datafusion-physical-expr-common",
- "hashbrown 0.17.1",
  "rand 0.9.4",
 ]
 

@@ -1,7 +1,7 @@
 use arrow::array::OffsetSizeTrait;
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use datafusion_common::utils::proxy::VecAllocExt;
-use datafusion_expr_common::groups_accumulator::BlocksIndex;
+use datafusion_common::utils::proxy::{VecAllocExt, VecDequeAllocExt};
+use crate::groups_accumulator::BlocksIndex;
 use std::collections::VecDeque;
 use std::ops::Index;
 
@@ -35,21 +35,22 @@ pub struct BlockedOffsetBufferBuilder<const FIXED_BLOCK_SIZING: bool, O: OffsetS
 
     pending_block: bool,
 
-    memory: usize,
+    finished_memory: usize,
 }
 
 impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
     BlockedOffsetBufferBuilder<FIXED_BLOCK_SIZING, O>
 {
     pub fn new(mut block_size: usize) -> Self {
-        assert_ne!(block_size, 0, "block size must be greater than 0");
+        if FIXED_BLOCK_SIZING {
+            assert_ne!(block_size, 0, "block size must be greater than 0");
+        }
 
         // Add 1 to the block size to account for the initial offset
         block_size += 1;
 
         let last_offset = O::zero();
         let blocks = VecDeque::from(vec![vec![last_offset]]);
-        let memory = blocks.capacity() * size_of::<Vec<O>>() + blocks[0].allocated_size();
         BlockedOffsetBufferBuilder {
             blocks,
             block_size,
@@ -58,7 +59,7 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
             last_offset,
             number_of_blocks: 1,
             pending_block: false,
-            memory,
+            finished_memory: 0,
         }
     }
 
@@ -67,12 +68,16 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
     }
 
     pub fn allocated_size(&self) -> usize {
-        self.memory
+        self.finished_memory + self.blocks.allocated_size() + self.blocks.back().map_or_else(0, |b| b.allocated_size())
     }
 
     /// Get the number of elements in the current block (not the number of offsets since the first offset is always 0)
-    pub(crate) fn current_block_len(&self) -> usize {
+    pub fn current_block_len(&self) -> usize {
         self.blocks[self.current_block_index].len() - 1
+    }
+
+    pub fn current_block_index(&self) -> usize {
+        self.blocks.len() - 1
     }
 
     pub fn last_offset(&self) -> O {
@@ -83,12 +88,9 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
         // Don't add to number of blocks since we might not insert into it
         self.current_block_index += 1;
         self.last_offset = O::zero();
-        let prev_capacity = self.blocks.capacity();
         let new_block = vec![self.last_offset];
-        self.memory += new_block.allocated_size();
+        self.finished_memory += self.blocks.back().as_ref().map_or_else(0, |b| b.allocated_size());
         self.blocks.push_back(new_block);
-        let new_capacity = self.blocks.capacity();
-        self.memory += (new_capacity - prev_capacity) * size_of::<Vec<O>>();
     }
 
     fn mark_as_having_value_in_block(&mut self) {
@@ -99,10 +101,27 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
     }
 
     pub(crate) fn reserve_blocks(&mut self, n: usize) {
-        let prev_capacity = self.blocks.capacity();
         self.blocks.reserve(n);
+    }
 
-        self.memory += (self.blocks.capacity() - prev_capacity) * size_of::<Vec<O>>();
+    pub fn push_next_offset_in_block(&mut self, next_offset_in_block: O) -> bool {
+        let mut block = &mut self.blocks[self.current_block_index];
+
+        assert!(next_offset_in_block >= self.last_offset, "offsets must be monotonically increasing");
+        self.last_offset = next_offset_in_block;
+        block.push(self.last_offset);
+        self.len += 1;
+
+        let finished_block = FIXED_BLOCK_SIZING && block.len() == self.block_size;
+
+        self.mark_as_having_value_in_block();
+
+        if finished_block {
+            self.start_new_block();
+            true
+        } else {
+            false
+        }
     }
 
     /// Push length and return if the current block is now full
@@ -110,7 +129,7 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
         let mut block = &mut self.blocks[self.current_block_index];
 
         self.last_offset += O::usize_as(length);
-        block.push_accounted(self.last_offset, &mut self.memory);
+        block.push(self.last_offset);
         self.len += 1;
 
         let finished_block = FIXED_BLOCK_SIZING && block.len() == self.block_size;
@@ -138,7 +157,6 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
         let mut block = &mut self.blocks[self.current_block_index];
 
         let prev_block_len = block.len();
-        let prev_block_capacity = block.capacity();
 
         for item_len in iter {
             self.last_offset += O::usize_as(item_len);
@@ -153,8 +171,6 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
                 self.block_size
             );
         }
-
-        self.memory += (block.capacity() - prev_block_capacity) * size_of::<O>();
 
         let added_items = block.len() - prev_block_len;
         self.len += added_items;
@@ -194,10 +210,8 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
         let block = &mut self.blocks[self.current_block_index];
         let prev_block_size = block.len();
 
-        let prev_block_capacity = block.capacity();
         // Do fast large copy
         block.extend_from_slice(&offset_buffer_slice[1..]);
-        self.memory += (block.capacity() - prev_block_capacity) * size_of::<O>();
 
         // Adjust the offset - can be easily SIMD.
         if offset_buffer_slice[0] > self.last_offset {
@@ -288,7 +302,6 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
 
         let block = &mut self.blocks[self.current_block_index];
         let prev_block_size = block.len();
-        let prev_block_capacity = block.capacity();
         for &index_to_copy in indexes {
             let length = offset_buffer_slice[index_to_copy]
                 - offset_buffer_slice[index_to_copy - 1];
@@ -296,8 +309,6 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
 
             block.push(self.last_offset);
         }
-
-        self.memory += (block.capacity() - prev_block_capacity) * size_of::<O>();
 
         let added_items = block.len() - prev_block_size;
 
@@ -364,8 +375,6 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
         let mut block = &mut self.blocks[self.current_block_index];
         let new_len = block.len() + n;
 
-        let prev_capacity = block.capacity();
-
         if FIXED_BLOCK_SIZING {
             assert!(
                 new_len <= self.block_size,
@@ -374,8 +383,6 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
             );
         }
         block.resize(new_len, self.last_offset);
-
-        self.memory += (block.capacity() - prev_capacity) * size_of::<O>();
 
         let finished_block = FIXED_BLOCK_SIZING && block.len() == self.block_size;
 
@@ -428,14 +435,11 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
         }
         let offset_to_add = O::usize_as(len);
 
-        let prev_capacity = block.capacity();
         block.resize_with(new_len, || {
             self.last_offset += offset_to_add;
 
             self.last_offset
         });
-
-        self.memory += (block.capacity() - prev_capacity) * size_of::<O>();
 
         let finished_block = FIXED_BLOCK_SIZING && block.len() == self.block_size;
 
@@ -495,8 +499,6 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
             assert_eq!(self.number_of_blocks, self.blocks.len());
         }
 
-        let prev_blocks_capacity = self.blocks.capacity();
-
         // TODO - set last offset, add empty block if now finished,
         // but avoid adding it if in last block so we won't get into infinite loop that we always insert one and we never have empty blocks to indicate end
         let block = self
@@ -504,23 +506,17 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
             .pop_front()
             .expect("we verified that we have at least 1 block");
 
-        self.memory -= block.capacity() * size_of::<O>();
-        self.memory -=
-            (self.blocks.capacity() - prev_blocks_capacity) * size_of::<Vec<O>>();
-
         self.number_of_blocks -= 1;
 
         if self.blocks.is_empty() {
             self.current_block_index = 0;
-            let prev_blocks_capacity = self.blocks.capacity();
-
             let block = vec![O::zero()];
-            self.memory += block.capacity() * size_of::<O>();
             self.blocks.push_back(block);
-            self.memory +=
-                (self.blocks.capacity() - prev_blocks_capacity) * size_of::<Vec<O>>();
         } else {
             self.current_block_index -= 1;
+
+            // Only if not the last block since the last block is calculated in allocated_size
+            self.finished_memory -= block.allocated_size();
         }
 
         self.last_offset = *self.blocks.back().unwrap().last().unwrap();
