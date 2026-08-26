@@ -245,7 +245,6 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
   pub fn push_n_non_nulls(&mut self, n: usize) {
     self.push_n(n, true);
   }
-  
 
   pub fn push_non_null(&mut self) {
     let mut block = &mut self.blocks[self.current_block_index];
@@ -273,7 +272,7 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
     }
   }
 
-  pub fn is_null(&self, blocked_index: BlockedIndex) -> bool {
+  pub fn is_null(&self, blocked_index: BlocksIndex) -> bool {
     !self.blocks[blocked_index.block_index()].is_valid(blocked_index.index_in_block())
   }
 

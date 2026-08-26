@@ -17,6 +17,8 @@
 
 //! Vectorized [`GroupsAccumulator`]
 
+pub mod enumerate_blocked;
+
 use arrow::array::{ArrayRef, BooleanArray};
 use datafusion_common::{Result, utils::split_vec_min_alloc};
 
@@ -245,7 +247,7 @@ pub trait GroupsAccumulator: Send + std::any::Any {
     fn size(&self) -> usize;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlocksIndex {
     block_index: usize,
     index_in_block: usize,
@@ -284,6 +286,39 @@ impl BlocksIndex {
             block_index: self.block_index,
             index_in_block: self.index_in_block + n,
         }
+    }
+
+    pub fn add_fixed(&self, n: usize, block_size: usize) -> Self {
+        let mut new = *self;
+        new.add_mut_fixed(n, block_size);
+        new
+    }
+
+    pub fn add_mut_fixed(&mut self, n: usize, block_size: usize) {
+        self.block_index +=(self.index_in_block + n) / block_size;
+        self.index_in_block = (self.index_in_block + n) % block_size;
+    }
+
+    pub fn next_fixed(&self, block_size: usize) -> Self {
+        let mut new = *self;
+        new.next_mut_fixed(block_size);
+        new
+    }
+
+    pub fn next_mut_fixed(&mut self, block_size: usize) {
+        self.block_index += ((self.index_in_block + 1) == block_size) as usize;
+        self.index_in_block = (self.index_in_block + 1) % block_size;
+    }
+
+    pub fn prev_fixed(&self, block_size: usize) -> Self {
+        let mut new = *self;
+        new.prev_mut_fixed(block_size);
+        new
+    }
+
+    pub fn prev_mut_fixed(&mut self, block_size: usize) {
+        self.block_index -= (self.index_in_block == 0) as usize;
+        self.index_in_block = self.index_in_block.wrapping_sub(1).min(block_size - 1);
     }
 }
 

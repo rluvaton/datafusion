@@ -32,6 +32,7 @@ use datafusion_functions_aggregate_common::aggregate::groups_accumulator::nulls:
 
 use datafusion_common::utils::split_vec_min_alloc;
 use datafusion_expr::groups_accumulator::{BlockedGroupsAccumulator, BlocksIndex};
+use datafusion_expr::groups_accumulator::enumerate_blocked::EnumerateBlockedIteratorExt;
 use datafusion_functions_aggregate_common::blocked_helpers::BlockedVecBuilder;
 
 /// Accumulator for MIN/MAX operations on Struct data types.
@@ -103,7 +104,7 @@ impl BlockedGroupsAccumulator for MinMaxStructBlockedAccumulator {
     }
 
     fn evaluate(&mut self) -> Result<ArrayRef> {
-        let (_, min_maxes) = self.inner.emit_to(emit_to);
+        let (_, min_maxes) = self.inner.emit_to();
         let DataType::Struct(fields) = &self.inner.data_type else {
             return internal_err!("Data type is not a struct");
         };
@@ -191,7 +192,7 @@ impl BlockedMinMaxStructState {
     }
 
     /// Set the specified group to the given value, updating memory usage appropriately
-    fn set_value(&mut self, group_index: usize, new_val: &StructArray) {
+    fn set_value(&mut self, group_index: BlocksIndex, new_val: &StructArray) {
         let new_val = StructArray::from(copy_array_data(&new_val.to_data()));
         match self.min_max[group_index].as_mut() {
             None => {
@@ -214,7 +215,7 @@ impl BlockedMinMaxStructState {
     fn update_batch<F>(
         &mut self,
         array: &StructArray,
-        group_indices: &[usize],
+        group_indices: &[BlocksIndex],
         total_num_groups: usize,
         mut cmp: F,
     ) -> Result<()>
@@ -228,6 +229,9 @@ impl BlockedMinMaxStructState {
 
             self.min_max.push_value_n(None, to_add);
         }
+
+        let block_size = self.min_max.block_size();
+
         // Minimize value copies by calculating the new min/maxes for each group
         // in this batch (either the existing min/max or the new input value)
         // and updating the owned values in `self.min_maxes` at most once
@@ -241,13 +245,15 @@ impl BlockedMinMaxStructState {
             }
             let new_val = array.slice(index, 1);
 
-            let existing_val = match &locations[group_index] {
+            let group_index_flat = group_index.into_index_in_fixed_block_size(block_size);
+
+            let existing_val = match &locations[group_index_flat] {
                 // previous input value was the min/max, so compare it
                 MinMaxLocation::Input(existing_val) => existing_val,
                 MinMaxLocation::ExistingMinMax => {
                     let Some(existing_val) = self.min_max[group_index].as_ref() else {
                         // no existing min/max, so this is the new min/max
-                        locations[group_index] = MinMaxLocation::Input(new_val);
+                        locations[group_index_flat] = MinMaxLocation::Input(new_val);
                         continue;
                     };
                     existing_val
@@ -256,12 +262,12 @@ impl BlockedMinMaxStructState {
 
             // Compare the new value to the existing value, replacing if necessary
             if cmp(&new_val, existing_val) {
-                locations[group_index] = MinMaxLocation::Input(new_val);
+                locations[group_index_flat] = MinMaxLocation::Input(new_val);
             }
         }
 
         // Update self.min_max with any new min/max values we found in the input
-        for (group_index, location) in locations.iter().enumerate() {
+        for (group_index, location) in locations.iter().enumerate_blocked(block_size) {
             match location {
                 MinMaxLocation::ExistingMinMax => {}
                 MinMaxLocation::Input(new_val) => self.set_value(group_index, new_val),
@@ -276,7 +282,7 @@ impl BlockedMinMaxStructState {
     ///
     /// - `data_capacity`: the total length of all strings and their contents,
     /// - `min_maxes`: the actual min/max values for each group
-    fn emit_to(&mut self, emit_to: EmitTo) -> (usize, Vec<Option<StructArray>>) {
+    fn emit_to(&mut self) -> (usize, Vec<Option<StructArray>>) {
         let next_block = self.min_max.take_block().expect("must have block if called");
 
         // reset min max reserved data
