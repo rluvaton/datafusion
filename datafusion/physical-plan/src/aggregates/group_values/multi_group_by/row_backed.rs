@@ -46,15 +46,15 @@
 //! [`GroupValuesColumn`]: crate::aggregates::group_values::multi_group_by::GroupValuesColumn
 //! [`GroupValuesRows`]: crate::aggregates::group_values::GroupValuesRows
 use std::ops::Index;
-use crate::execution::aggregates::group_values::multi_group_by::GroupColumn;
-use crate::execution::aggregates::group_values::row::encode_array_if_necessary;
 
+use crate::aggregates::group_values::multi_group_by::GroupColumn;
+use crate::aggregates::group_values::row::encode_array_if_necessary;
 use arrow::array::{Array, ArrayRef, BooleanBufferBuilder};
 use arrow::datatypes::DataType;
 use arrow::row::{RowConverter, Rows, SortField};
-use datafusion::common::{DataFusionError, Result};
-use crate::execution::aggregates::group_values::blocked_primitives::{BlockedRowsBuilder};
-use crate::execution::aggregates::group_values::blocked_primitives::BlockedIndex;
+use datafusion_common::{DataFusionError, Result};
+use datafusion_expr_common::groups_accumulator::BlocksIndex;
+use datafusion_functions_aggregate_common::blocked_helpers::BlockedRowsBuilder;
 
 /// A [`GroupColumn`] that stores group values for a single column in the arrow
 /// [row format], backed by a single-field [`RowConverter`].
@@ -214,8 +214,10 @@ impl<const FIXED_BLOCK_SIZING: bool> RowsGroupColumn<FIXED_BLOCK_SIZING> {
     }
 }
 
-impl<const FIXED_BLOCK_SIZING: bool> GroupColumn<FIXED_BLOCK_SIZING> for RowsGroupColumn<FIXED_BLOCK_SIZING> {
-    fn equal_to(&self, lhs_row: BlockedIndex, array: &ArrayRef, rhs_row: usize) -> bool {
+impl<const FIXED_BLOCK_SIZING: bool> GroupColumn<FIXED_BLOCK_SIZING>
+    for RowsGroupColumn<FIXED_BLOCK_SIZING>
+{
+    fn equal_to(&self, lhs_row: BlocksIndex, array: &ArrayRef, rhs_row: usize) -> bool {
         // Scalar path (hash-collision remainder / streaming). Encode just the
         // single incoming row rather than the whole column. The vectorized
         // methods below encode the batch once; this path is expected to be rare.
@@ -233,7 +235,7 @@ impl<const FIXED_BLOCK_SIZING: bool> GroupColumn<FIXED_BLOCK_SIZING> for RowsGro
 
     fn vectorized_equal_to(
         &self,
-        lhs_rows: &[BlockedIndex],
+        lhs_rows: &[BlocksIndex],
         array: &ArrayRef,
         rhs_rows: &[usize],
         equal_to_results: &mut BooleanBufferBuilder,
@@ -296,9 +298,9 @@ impl<const FIXED_BLOCK_SIZING: bool> GroupColumn<FIXED_BLOCK_SIZING> for RowsGro
     fn take_block(&mut self) -> Option<ArrayRef> {
         let block = self.group_values.take_block()?;
         let mut arrays = self
-          .row_converter()
-          .convert_rows(block.iter())
-          .expect("row conversion during emit");
+            .row_converter()
+            .convert_rows(block.iter())
+            .expect("row conversion during emit");
         assert_eq!(
             arrays.len(),
             1,
@@ -306,8 +308,10 @@ impl<const FIXED_BLOCK_SIZING: bool> GroupColumn<FIXED_BLOCK_SIZING> for RowsGro
             arrays.len()
         );
         let array = arrays.pop().unwrap();
-        Some(encode_array_if_necessary(&array, &self.output_type)
-          .expect("dictionary re-encode during emit"))
+        Some(
+            encode_array_if_necessary(&array, &self.output_type)
+                .expect("dictionary re-encode during emit"),
+        )
     }
 
     fn start_new_block(&mut self) {
@@ -364,15 +368,20 @@ mod tests {
             2,
         );
 
-        assert!(col.equal_to(0, &probe, 0));
-        assert!(col.equal_to(1, &probe, 1));
-        assert!(!col.equal_to(0, &probe, 2));
-        assert!(col.equal_to(2, &probe, 3));
+        assert!(col.equal_to(BlocksIndex::new_in_first_block(0), &probe, 0));
+        assert!(col.equal_to(BlocksIndex::new_in_first_block(1), &probe, 1));
+        assert!(!col.equal_to(BlocksIndex::new_in_first_block(0), &probe, 2));
+        assert!(col.equal_to(BlocksIndex::new_in_first_block(2), &probe, 3));
 
         // Vectorized equal_to should match the scalar reference.
         let mut results = BooleanBufferBuilder::new(3);
         results.append_n(3, true);
-        col.vectorized_equal_to(&[0, 1, 2], &probe, &[0, 1, 3], &mut results);
+        col.vectorized_equal_to(
+            &[0, 1, 2].map(BlocksIndex::new_in_first_block),
+            &probe,
+            &[0, 1, 3],
+            &mut results,
+        );
         assert!(results.get_bit(0));
         assert!(results.get_bit(1));
         assert!(results.get_bit(2));
@@ -392,7 +401,7 @@ mod tests {
             Arc::new(Field::new("item", DataType::Int32, true)),
             1,
         );
-        let mut col = RowsGroupColumn::try_new(dt).unwrap();
+        let mut col = RowsGroupColumn::<false>::try_new(dt, 0).unwrap();
 
         let input = fsl_i32(
             vec![
@@ -432,7 +441,7 @@ mod tests {
     #[test]
     fn struct_roundtrip() {
         let dt = DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into());
-        let mut col = RowsGroupColumn::try_new(dt).unwrap();
+        let mut col = RowsGroupColumn::<false>::try_new(dt, 0).unwrap();
 
         let a: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), Some(2)]));
         let input: ArrayRef = Arc::new(StructArray::new(
@@ -442,17 +451,19 @@ mod tests {
         ));
         col.vectorized_append(&input, &[0, 1]).unwrap();
         assert_eq!(col.len(), 2);
-        assert!(col.equal_to(0, &input, 0));
-        assert!(!col.equal_to(0, &input, 1));
+        assert!(col.equal_to(BlocksIndex::new_in_first_block(0), &input, 0));
+        assert!(!col.equal_to(BlocksIndex::new_in_first_block(0), &input, 1));
     }
 
     #[test]
     fn supports_type_matches_row_converter_impl() {
-        assert!(RowsGroupColumn::supports_type(&DataType::FixedSizeList(
-            Arc::new(Field::new("item", DataType::Int32, true)),
-            3
-        )));
-        assert!(RowsGroupColumn::supports_type(&DataType::Struct(
+        assert!(RowsGroupColumn::<false>::supports_type(
+            &DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Int32, true)),
+                3
+            )
+        ));
+        assert!(RowsGroupColumn::<false>::supports_type(&DataType::Struct(
             vec![Field::new("a", DataType::Int32, true)].into()
         )));
         // Whether Map is encodable depends on the arrow-rs version.
@@ -473,7 +484,10 @@ mod tests {
         let map_dt = DataType::Map(map_field, false);
         let arrow_supports =
             RowConverter::supports_fields(&[SortField::new(map_dt.clone())]);
-        assert_eq!(RowsGroupColumn::supports_type(&map_dt), arrow_supports);
+        assert_eq!(
+            RowsGroupColumn::<false>::supports_type(&map_dt),
+            arrow_supports
+        );
     }
 
     /// Regression test for the nested-container recursion in
@@ -497,11 +511,12 @@ mod tests {
         // Skip if this arrow-rs version rejects the nesting — the invariant we
         // care about is `output().data_type() == declared type` conditional on
         // supports_type saying yes.
-        if !RowsGroupColumn::supports_type(&outer_dt) {
+        if !RowsGroupColumn::<false>::supports_type(&outer_dt) {
             return;
         }
 
-        let mut col = Box::new(RowsGroupColumn::try_new(outer_dt.clone()).unwrap());
+        let mut col =
+            Box::new(RowsGroupColumn::<false>::try_new(outer_dt.clone(), 0).unwrap());
 
         // Build List<Dict<Int32,Utf8>> of one row = ["a", "b"].
         let values = Arc::new(StringArray::from(vec!["a", "b"]));
@@ -544,7 +559,9 @@ mod tests {
     #[test]
     fn supports_type_rejects_fixed_size_list_of_dict() {
         // Direct case: `FixedSizeList<Dict<Int32, Utf8>>`.
-        assert!(!RowsGroupColumn::supports_type(&fsl_of(dict_utf8())));
+        assert!(!RowsGroupColumn::<false>::supports_type(&fsl_of(
+            dict_utf8()
+        )));
     }
 
     #[test]
@@ -554,7 +571,7 @@ mod tests {
         // returns the struct with a decoded (Utf8) field while the
         // FSL builder expects the declared struct-with-dict shape.
         let struct_dt = DataType::Struct(vec![Field::new("d", dict_utf8(), true)].into());
-        assert!(!RowsGroupColumn::supports_type(&fsl_of(struct_dt)));
+        assert!(!RowsGroupColumn::<false>::supports_type(&fsl_of(struct_dt)));
     }
 
     #[test]
@@ -564,7 +581,9 @@ mod tests {
         // panics with the mismatched declared child type.
         let list_of_dict =
             DataType::List(Arc::new(Field::new("item", dict_utf8(), true)));
-        assert!(!RowsGroupColumn::supports_type(&fsl_of(list_of_dict)));
+        assert!(!RowsGroupColumn::<false>::supports_type(&fsl_of(
+            list_of_dict
+        )));
     }
 
     #[test]
@@ -575,7 +594,7 @@ mod tests {
         // wraps it, so this must still be rejected.
         let outer =
             DataType::List(Arc::new(Field::new("item", fsl_of(dict_utf8()), true)));
-        assert!(!RowsGroupColumn::supports_type(&outer));
+        assert!(!RowsGroupColumn::<false>::supports_type(&outer));
     }
 
     #[test]
@@ -583,7 +602,7 @@ mod tests {
         // Same, but the outer wrapper is a struct.
         let outer =
             DataType::Struct(vec![Field::new("f", fsl_of(dict_utf8()), true)].into());
-        assert!(!RowsGroupColumn::supports_type(&outer));
+        assert!(!RowsGroupColumn::<false>::supports_type(&outer));
     }
 
     // ---- FSL without dicts is still fine ----------------------------
@@ -592,7 +611,9 @@ mod tests {
     fn supports_type_accepts_fsl_of_primitive() {
         // Sanity: a plain FSL<Int32> must not get caught by the
         // dict-under-FSL blacklist.
-        assert!(RowsGroupColumn::supports_type(&fsl_of(DataType::Int32)));
+        assert!(RowsGroupColumn::<false>::supports_type(&fsl_of(
+            DataType::Int32
+        )));
     }
 
     #[test]
@@ -600,7 +621,7 @@ mod tests {
         // FSL of struct where the struct's fields are all primitives.
         let struct_dt =
             DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into());
-        assert!(RowsGroupColumn::supports_type(&fsl_of(struct_dt)));
+        assert!(RowsGroupColumn::<false>::supports_type(&fsl_of(struct_dt)));
     }
 
     // ---- Positive round-trip tests for non-FSL list-likes -----------
@@ -617,19 +638,19 @@ mod tests {
     #[test]
     fn supports_type_accepts_large_list_of_dict() {
         let dt = DataType::LargeList(Arc::new(Field::new("item", dict_utf8(), true)));
-        assert!(RowsGroupColumn::supports_type(&dt));
+        assert!(RowsGroupColumn::<false>::supports_type(&dt));
     }
 
     #[test]
     fn supports_type_accepts_list_view_of_dict() {
         let dt = DataType::ListView(Arc::new(Field::new("item", dict_utf8(), true)));
-        assert!(RowsGroupColumn::supports_type(&dt));
+        assert!(RowsGroupColumn::<false>::supports_type(&dt));
     }
 
     #[test]
     fn supports_type_accepts_large_list_view_of_dict() {
         let dt = DataType::LargeListView(Arc::new(Field::new("item", dict_utf8(), true)));
-        assert!(RowsGroupColumn::supports_type(&dt));
+        assert!(RowsGroupColumn::<false>::supports_type(&dt));
     }
 
     #[test]
@@ -652,7 +673,10 @@ mod tests {
         let map_dt = DataType::Map(entries, false);
         let arrow_supports =
             RowConverter::supports_fields(&[SortField::new(map_dt.clone())]);
-        assert_eq!(RowsGroupColumn::supports_type(&map_dt), arrow_supports);
+        assert_eq!(
+            RowsGroupColumn::<false>::supports_type(&map_dt),
+            arrow_supports
+        );
     }
 
     /// End-to-end regression: `LargeList<Dict<Int32, Utf8>>` must
@@ -669,11 +693,12 @@ mod tests {
         // Skip if this arrow-rs version rejects the nesting (defensive:
         // the invariant we care about is `output().data_type() == declared`
         // conditional on `supports_type` saying yes).
-        if !RowsGroupColumn::supports_type(&outer_dt) {
+        if !RowsGroupColumn::<false>::supports_type(&outer_dt) {
             return;
         }
 
-        let mut col = Box::new(RowsGroupColumn::try_new(outer_dt.clone()).unwrap());
+        let mut col =
+            Box::new(RowsGroupColumn::<false>::try_new(outer_dt.clone(), 0).unwrap());
 
         let values = Arc::new(StringArray::from(vec!["a", "b"]));
         let keys = Int32Array::from(vec![0, 1]);
@@ -731,11 +756,12 @@ mod tests {
     #[test]
     fn build_preserves_list_view_of_dictionary_schema() {
         let (outer_dt, input) = list_view_of_dict_input();
-        if !RowsGroupColumn::supports_type(&outer_dt) {
+        if !RowsGroupColumn::<false>::supports_type(&outer_dt) {
             return;
         }
 
-        let mut col = Box::new(RowsGroupColumn::try_new(outer_dt.clone()).unwrap());
+        let mut col =
+            Box::new(RowsGroupColumn::<false>::try_new(outer_dt.clone(), 0).unwrap());
         col.vectorized_append(&input, &[0, 1]).unwrap();
         assert_eq!(col.len(), 2);
 
@@ -755,11 +781,12 @@ mod tests {
     #[test]
     fn take_n_preserves_list_view_of_dictionary_schema() {
         let (outer_dt, input) = list_view_of_dict_input();
-        if !RowsGroupColumn::supports_type(&outer_dt) {
+        if !RowsGroupColumn::<false>::supports_type(&outer_dt) {
             return;
         }
 
-        let mut col = Box::new(RowsGroupColumn::try_new(outer_dt.clone()).unwrap());
+        let mut col =
+            Box::new(RowsGroupColumn::<false>::try_new(outer_dt.clone(), 0).unwrap());
         col.vectorized_append(&input, &[0, 1]).unwrap();
 
         let taken = col.take_n(1);
@@ -788,7 +815,7 @@ mod tests {
 
         let item_field = Arc::new(Field::new("item", dict_utf8(), true));
         let outer_dt = DataType::LargeListView(Arc::clone(&item_field));
-        if !RowsGroupColumn::supports_type(&outer_dt) {
+        if !RowsGroupColumn::<false>::supports_type(&outer_dt) {
             return;
         }
 
@@ -807,7 +834,8 @@ mod tests {
         .unwrap();
         let input: ArrayRef = Arc::new(list);
 
-        let mut col = Box::new(RowsGroupColumn::try_new(outer_dt.clone()).unwrap());
+        let mut col =
+            Box::new(RowsGroupColumn::<false>::try_new(outer_dt.clone(), 0).unwrap());
         col.vectorized_append(&input, &[0, 1]).unwrap();
 
         let taken = col.take_n(1);
@@ -838,7 +866,7 @@ mod tests {
 
         let item_field = Arc::new(Field::new("item", dict_utf8(), true));
         let outer_dt = DataType::ListView(Arc::clone(&item_field));
-        if !RowsGroupColumn::supports_type(&outer_dt) {
+        if !RowsGroupColumn::<false>::supports_type(&outer_dt) {
             return;
         }
 
@@ -858,17 +886,18 @@ mod tests {
         .unwrap();
         let input: ArrayRef = Arc::new(list);
 
-        let mut col = Box::new(RowsGroupColumn::try_new(outer_dt.clone()).unwrap());
+        let mut col =
+            Box::new(RowsGroupColumn::<false>::try_new(outer_dt.clone(), 0).unwrap());
         // Append row 0 as group 0.
         col.vectorized_append(&input, &[0]).unwrap();
         // Row 1 must compare equal to group 0 (same logical value).
         assert!(
-            col.equal_to(0, &input, 1),
+            col.equal_to(BlocksIndex::new_in_first_block(0), &input, 1),
             "identical logical lists must be equal regardless of dict keys",
         );
         // Row 2 must not.
         assert!(
-            !col.equal_to(0, &input, 2),
+            !col.equal_to(BlocksIndex::new_in_first_block(0), &input, 2),
             "different logical lists must not be equal",
         );
 
@@ -898,11 +927,12 @@ mod tests {
         ));
         let outer_dt = DataType::Map(Arc::clone(&entries_field), false);
 
-        if !RowsGroupColumn::supports_type(&outer_dt) {
+        if !RowsGroupColumn::<false>::supports_type(&outer_dt) {
             return;
         }
 
-        let mut col = Box::new(RowsGroupColumn::try_new(outer_dt.clone()).unwrap());
+        let mut col =
+            Box::new(RowsGroupColumn::<false>::try_new(outer_dt.clone(), 0).unwrap());
 
         // One map entry: {1 -> "a"}.
         let keys = Arc::new(Int32Array::from(vec![1])) as ArrayRef;
@@ -955,7 +985,7 @@ mod tests {
         .unwrap();
         let dt = DataType::Union(fields, arrow::datatypes::UnionMode::Dense);
         assert!(
-            !RowsGroupColumn::supports_type(&dt),
+            !RowsGroupColumn::<false>::supports_type(&dt),
             "Union must fall back to GroupValuesRows until arrow-row \
              round-trip is covered by our tests",
         );
@@ -972,7 +1002,7 @@ mod tests {
             Arc::new(Field::new("run_ends", DataType::Int32, false)),
             Arc::new(Field::new("values", list_of_i32, true)),
         );
-        assert!(!RowsGroupColumn::supports_type(&dt));
+        assert!(!RowsGroupColumn::<false>::supports_type(&dt));
     }
 
     #[test]
@@ -985,7 +1015,7 @@ mod tests {
             Arc::new(Field::new("run_ends", DataType::Int32, false)),
             Arc::new(Field::new("values", DataType::Utf8, true)),
         );
-        assert!(!RowsGroupColumn::supports_type(&dt));
+        assert!(!RowsGroupColumn::<false>::supports_type(&dt));
     }
 
     #[test]
@@ -998,7 +1028,7 @@ mod tests {
             Arc::new(Field::new("values", DataType::Utf8, true)),
         );
         let outer = DataType::Struct(vec![Field::new("f", ree, true)].into());
-        assert!(!RowsGroupColumn::supports_type(&outer));
+        assert!(!RowsGroupColumn::<false>::supports_type(&outer));
     }
 
     #[test]
@@ -1008,7 +1038,7 @@ mod tests {
         // exists to serve.
         let list_of_int =
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
-        assert!(RowsGroupColumn::supports_type(&list_of_int));
+        assert!(RowsGroupColumn::<false>::supports_type(&list_of_int));
 
         let struct_of_prims = DataType::Struct(
             vec![
@@ -1017,6 +1047,6 @@ mod tests {
             ]
             .into(),
         );
-        assert!(RowsGroupColumn::supports_type(&struct_of_prims));
+        assert!(RowsGroupColumn::<false>::supports_type(&struct_of_prims));
     }
 }

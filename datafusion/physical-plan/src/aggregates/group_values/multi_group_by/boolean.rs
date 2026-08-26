@@ -17,13 +17,15 @@
 
 use std::sync::Arc;
 
-use crate::aggregates::group_values::multi_group_by::Nulls;
-use crate::aggregates::group_values::multi_group_by::{GroupColumn, nulls_equal_to};
-use crate::aggregates::group_values::null_builder::NullBufferBuilderExt;
-use arrow::array::{
-    Array as _, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder, NullBufferBuilder,
+use crate::aggregates::group_values::multi_group_by::{
+    GroupColumn, Nulls, nulls_equal_to,
 };
+use arrow::array::{Array as _, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder};
 use datafusion_common::Result;
+use datafusion_expr_common::groups_accumulator::BlocksIndex;
+use datafusion_functions_aggregate_common::blocked_helpers::{
+    BlockedBooleanBuilder, BlockedNullsBuilder,
+};
 
 /// An implementation of [`GroupColumn`] for booleans
 ///
@@ -33,23 +35,33 @@ use datafusion_common::Result;
 ///
 /// `NULLABLE`: if the data can contain any nulls
 #[derive(Debug)]
-pub struct BooleanGroupValueBuilder<const NULLABLE: bool> {
-    buffer: BooleanBufferBuilder,
-    nulls: NullBufferBuilder,
+pub struct BooleanGroupValueBuilder<const FIXED_BLOCK_SIZING: bool, const NULLABLE: bool>
+{
+    buffer: BlockedBooleanBuilder<FIXED_BLOCK_SIZING>,
+    nulls: BlockedNullsBuilder<FIXED_BLOCK_SIZING>,
+    block_size: usize,
 }
 
-impl<const NULLABLE: bool> BooleanGroupValueBuilder<NULLABLE> {
+impl<const FIXED_BLOCK_SIZING: bool, const NULLABLE: bool>
+    BooleanGroupValueBuilder<FIXED_BLOCK_SIZING, NULLABLE>
+{
     /// Create a new `BooleanGroupValueBuilder`
-    pub fn new() -> Self {
+    pub fn new(block_size: usize) -> Self {
+        if FIXED_BLOCK_SIZING {
+            assert_ne!(block_size, 0)
+        }
         Self {
-            buffer: BooleanBufferBuilder::new(0),
-            nulls: NullBufferBuilder::empty(),
+            buffer: BlockedBooleanBuilder::new(block_size),
+            nulls: BlockedNullsBuilder::new(block_size),
+            block_size,
         }
     }
 }
 
-impl<const NULLABLE: bool> GroupColumn for BooleanGroupValueBuilder<NULLABLE> {
-    fn equal_to(&self, lhs_row: usize, array: &ArrayRef, rhs_row: usize) -> bool {
+impl<const FIXED_BLOCK_SIZING: bool, const NULLABLE: bool> GroupColumn<FIXED_BLOCK_SIZING>
+    for BooleanGroupValueBuilder<FIXED_BLOCK_SIZING, NULLABLE>
+{
+    fn equal_to(&self, lhs_row: BlocksIndex, array: &ArrayRef, rhs_row: usize) -> bool {
         if NULLABLE {
             let exist_null = self.nulls.is_null(lhs_row);
             let input_null = array.is_null(rhs_row);
@@ -64,10 +76,10 @@ impl<const NULLABLE: bool> GroupColumn for BooleanGroupValueBuilder<NULLABLE> {
     fn append_val(&mut self, array: &ArrayRef, row: usize) -> Result<()> {
         if NULLABLE {
             if array.is_null(row) {
-                self.nulls.append_null();
+                self.nulls.push_null();
                 self.buffer.append(bool::default());
             } else {
-                self.nulls.append_non_null();
+                self.nulls.push_non_null();
                 self.buffer.append(array.as_boolean().value(row));
             }
         } else {
@@ -79,7 +91,7 @@ impl<const NULLABLE: bool> GroupColumn for BooleanGroupValueBuilder<NULLABLE> {
 
     fn vectorized_equal_to(
         &self,
-        lhs_rows: &[usize],
+        lhs_rows: &[BlocksIndex],
         array: &ArrayRef,
         rhs_rows: &[usize],
         equal_to_results: &mut BooleanBufferBuilder,
@@ -127,24 +139,24 @@ impl<const NULLABLE: bool> GroupColumn for BooleanGroupValueBuilder<NULLABLE> {
             (true, Nulls::Some) => {
                 for &row in rows {
                     if array.is_null(row) {
-                        self.nulls.append_null();
+                        self.nulls.push_null();
                         self.buffer.append(bool::default());
                     } else {
-                        self.nulls.append_non_null();
+                        self.nulls.push_non_null();
                         self.buffer.append(arr.value(row));
                     }
                 }
             }
 
             (true, Nulls::None) => {
-                self.nulls.append_n_non_nulls(rows.len());
+                self.nulls.push_n_non_nulls(rows.len());
                 for &row in rows {
                     self.buffer.append(arr.value(row));
                 }
             }
 
             (true, Nulls::All) => {
-                self.nulls.append_n_nulls(rows.len());
+                self.nulls.push_n_nulls(rows.len());
                 self.buffer.append_n(rows.len(), bool::default());
             }
 
@@ -163,33 +175,67 @@ impl<const NULLABLE: bool> GroupColumn for BooleanGroupValueBuilder<NULLABLE> {
     }
 
     fn size(&self) -> usize {
-        self.buffer.capacity() / 8 + self.nulls.allocated_size()
+        self.buffer.allocated_size() + self.nulls.allocated_size()
     }
+    //
+    // fn build(self: Box<Self>) -> ArrayRef {
+    //     let Self { mut buffer, nulls } = *self;
+    //
+    //     let nulls = nulls.build();
+    //     if !NULLABLE {
+    //         assert!(nulls.is_none(), "unexpected nulls in non nullable input");
+    //     }
+    //
+    //     let arr = BooleanArray::new(buffer.finish(), nulls);
+    //
+    //     Arc::new(arr)
+    // }
+    //
+    // fn take_n(&mut self, n: usize) -> ArrayRef {
+    //     let first_n_nulls = if NULLABLE { self.nulls.take_n(n) } else { None };
+    //
+    //     let mut new_builder = BooleanBufferBuilder::new(self.buffer.len());
+    //     new_builder.append_packed_range(n..self.buffer.len(), self.buffer.as_slice());
+    //     std::mem::swap(&mut new_builder, &mut self.buffer);
+    //
+    //     // take only first n values from the original builder
+    //     new_builder.truncate(n);
+    //
+    //     Arc::new(BooleanArray::new(new_builder.finish(), first_n_nulls))
+    // }
 
-    fn build(self: Box<Self>) -> ArrayRef {
-        let Self { mut buffer, nulls } = *self;
+    fn take_block(&mut self) -> Option<ArrayRef> {
+        let values = self.buffer.take_block();
 
-        let nulls = nulls.build();
-        if !NULLABLE {
-            assert!(nulls.is_none(), "unexpected nulls in non nullable input");
+        let nulls = if NULLABLE {
+            self.nulls.take_block()
+        } else {
+            // if one have block, the other have block
+            values.as_ref().map(|_| None)
+        };
+
+        match (nulls, values) {
+            (Some(nulls), Some(values)) => {
+                Some(Arc::new(BooleanArray::new(values, nulls)))
+            }
+            (None, None) => None,
+            (None, Some(_)) => {
+                unreachable!("does not have nulls blocks but have values block")
+            }
+            (Some(_), None) => {
+                unreachable!("does not have values blocks but have nulls block")
+            }
         }
-
-        let arr = BooleanArray::new(buffer.finish(), nulls);
-
-        Arc::new(arr)
     }
 
-    fn take_n(&mut self, n: usize) -> ArrayRef {
-        let first_n_nulls = if NULLABLE { self.nulls.take_n(n) } else { None };
+    fn start_new_block(&mut self) {
+        assert!(
+            !FIXED_BLOCK_SIZING,
+            "must not create new block when block sizing is managed internally"
+        );
 
-        let mut new_builder = BooleanBufferBuilder::new(self.buffer.len());
-        new_builder.append_packed_range(n..self.buffer.len(), self.buffer.as_slice());
-        std::mem::swap(&mut new_builder, &mut self.buffer);
-
-        // take only first n values from the original builder
-        new_builder.truncate(n);
-
-        Arc::new(BooleanArray::new(new_builder.finish(), first_n_nulls))
+        self.nulls.start_new_block();
+        self.buffer.start_new_block();
     }
 }
 
@@ -211,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_nullable_boolean_equal_to() {
-        let append = |builder: &mut BooleanGroupValueBuilder<true>,
+        let append = |builder: &mut BooleanGroupValueBuilder<false, true>,
                       builder_array: &ArrayRef,
                       append_rows: &[usize]| {
             for &index in append_rows {
@@ -220,8 +266,8 @@ mod tests {
         };
 
         let equal_to =
-            |builder: &BooleanGroupValueBuilder<true>,
-             lhs_rows: &[usize],
+            |builder: &BooleanGroupValueBuilder<false, true>,
+             lhs_rows: &[BlocksIndex],
              input_array: &ArrayRef,
              rhs_rows: &[usize],
              equal_to_results: &mut BooleanBufferBuilder| {
@@ -237,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_nullable_primitive_vectorized_equal_to() {
-        let append = |builder: &mut BooleanGroupValueBuilder<true>,
+        let append = |builder: &mut BooleanGroupValueBuilder<false, true>,
                       builder_array: &ArrayRef,
                       append_rows: &[usize]| {
             builder
@@ -246,8 +292,8 @@ mod tests {
         };
 
         let equal_to =
-            |builder: &BooleanGroupValueBuilder<true>,
-             lhs_rows: &[usize],
+            |builder: &BooleanGroupValueBuilder<false, true>,
+             lhs_rows: &[BlocksIndex],
              input_array: &ArrayRef,
              rhs_rows: &[usize],
              equal_to_results: &mut BooleanBufferBuilder| {
@@ -264,9 +310,9 @@ mod tests {
 
     fn test_nullable_boolean_equal_to_internal<A, E>(mut append: A, mut equal_to: E)
     where
-        A: FnMut(&mut BooleanGroupValueBuilder<true>, &ArrayRef, &[usize]),
+        A: FnMut(&mut BooleanGroupValueBuilder<false, true>, &ArrayRef, &[usize]),
         E: FnMut(
-            &BooleanGroupValueBuilder<true>,
+            &BooleanGroupValueBuilder<false, true>,
             &[usize],
             &ArrayRef,
             &[usize],
@@ -282,7 +328,7 @@ mod tests {
         //   - exist not null, input not null; values equal
 
         // Define BooleanGroupValueBuilder
-        let mut builder = BooleanGroupValueBuilder::<true>::new();
+        let mut builder = BooleanGroupValueBuilder::<false, true>::new(0);
         let builder_array = Arc::new(BooleanArray::from(vec![
             None,
             None,
@@ -335,7 +381,7 @@ mod tests {
 
     #[test]
     fn test_not_nullable_primitive_equal_to() {
-        let append = |builder: &mut BooleanGroupValueBuilder<false>,
+        let append = |builder: &mut BooleanGroupValueBuilder<false, false>,
                       builder_array: &ArrayRef,
                       append_rows: &[usize]| {
             for &index in append_rows {
@@ -344,15 +390,21 @@ mod tests {
         };
 
         let equal_to =
-            |builder: &BooleanGroupValueBuilder<false>,
+            |builder: &BooleanGroupValueBuilder<false, false>,
              lhs_rows: &[usize],
              input_array: &ArrayRef,
              rhs_rows: &[usize],
              equal_to_results: &mut BooleanBufferBuilder| {
                 let iter = lhs_rows.iter().zip(rhs_rows.iter());
                 for (idx, (&lhs_row, &rhs_row)) in iter.enumerate() {
-                    equal_to_results
-                        .set_bit(idx, builder.equal_to(lhs_row, input_array, rhs_row));
+                    equal_to_results.set_bit(
+                        idx,
+                        builder.equal_to(
+                            BlocksIndex::new(0, lhs_row),
+                            input_array,
+                            rhs_row,
+                        ),
+                    );
                 }
             };
 
@@ -361,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_not_nullable_primitive_vectorized_equal_to() {
-        let append = |builder: &mut BooleanGroupValueBuilder<false>,
+        let append = |builder: &mut BooleanGroupValueBuilder<false, false>,
                       builder_array: &ArrayRef,
                       append_rows: &[usize]| {
             builder
@@ -370,8 +422,8 @@ mod tests {
         };
 
         let equal_to =
-            |builder: &BooleanGroupValueBuilder<false>,
-             lhs_rows: &[usize],
+            |builder: &BooleanGroupValueBuilder<false, false>,
+             lhs_rows: &[BlocksIndex],
              input_array: &ArrayRef,
              rhs_rows: &[usize],
              equal_to_results: &mut BooleanBufferBuilder| {
@@ -388,9 +440,9 @@ mod tests {
 
     fn test_not_nullable_boolean_equal_to_internal<A, E>(mut append: A, mut equal_to: E)
     where
-        A: FnMut(&mut BooleanGroupValueBuilder<false>, &ArrayRef, &[usize]),
+        A: FnMut(&mut BooleanGroupValueBuilder<false, false>, &ArrayRef, &[usize]),
         E: FnMut(
-            &BooleanGroupValueBuilder<false>,
+            &BooleanGroupValueBuilder<false, false>,
             &[usize],
             &ArrayRef,
             &[usize],
@@ -402,7 +454,7 @@ mod tests {
         //   - values not equal
 
         // Define BooleanGroupValueBuilder
-        let mut builder = BooleanGroupValueBuilder::<false>::new();
+        let mut builder = BooleanGroupValueBuilder::<false, false>::new(0);
         let builder_array = Arc::new(BooleanArray::from(vec![
             Some(false),
             Some(true),
@@ -441,7 +493,7 @@ mod tests {
         // Test the special `all nulls` or `not nulls` input array case
         // for vectorized append and equal to
 
-        let mut builder = BooleanGroupValueBuilder::<true>::new();
+        let mut builder = BooleanGroupValueBuilder::<false, true>::new(0);
 
         // All nulls input array
         let all_nulls_input_array =
@@ -452,7 +504,9 @@ mod tests {
 
         let mut equal_to_results = make_true_buffer(all_nulls_input_array.len());
         builder.vectorized_equal_to(
-            &[0, 1, 2, 3, 4],
+            [0, 1, 2, 3, 4]
+                .map(BlocksIndex::new_in_first_block)
+                .as_slice(),
             &all_nulls_input_array,
             &[0, 1, 2, 3, 4],
             &mut equal_to_results,
@@ -479,7 +533,9 @@ mod tests {
 
         let mut equal_to_results = make_true_buffer(all_not_nulls_input_array.len());
         builder.vectorized_equal_to(
-            &[5, 6, 7, 8, 9],
+            [5, 6, 7, 8, 9]
+                .map(BlocksIndex::new_in_first_block)
+                .as_slice(),
             &all_not_nulls_input_array,
             &[0, 1, 2, 3, 4],
             &mut equal_to_results,
