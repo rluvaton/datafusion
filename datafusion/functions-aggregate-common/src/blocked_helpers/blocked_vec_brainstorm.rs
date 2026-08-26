@@ -1,51 +1,50 @@
-
 /// Suppose to provide the same API as [`Vec`] but with the functionality to take owned blocks
 ///
 /// But because this is a blocked implementation, some underline implementations might not allow a slice
 /// over the entire underlying data, so providing that API in case the current underlying implementation allows that
 /// will limit us from changing the underlying implementation without breaking the API.
 pub struct BlockedVec<T> {
-  /// # Implementations considerations
-  ///
-  /// ## `Vec<Vec<T>>`
-  /// The naive approach is doing `Vec<Vec<T>>`
-  ///
-  /// ### Advantages:
-  /// 1. Easy to implement
-  /// 2. Easy to reason about from a high level
-  ///
-  /// ### Disadvantages:
-  /// 1. The vecs are not contiguous in memory, so you will have:
-  ///   1. More cache misses
-  ///   2. Less prefetching optimizations
-  /// 2. Taking the first `block_size / 2` will:
-  ///   1. leave the first block with half the elements
-  ///   2. will not free the memory for the taken elements
-  ///   3. Any next taking `block_size` will require copy to combine into a single `Vec`
-  /// 3. You can't have a slice over the entire underlying data
-  ///
-  /// ## `Vec<T, MMAP>`
-  /// The more complex approach is using [`Vec`] backed by mmap
-  ///
-  /// ### Advantages:
-  /// 1. Can hold on a slice of the entire underlying data (I think)
-  /// 2. The data between blocks are contiguous in memory (I think)
-  /// 3. Allows you to take owned blocks which will free when dropped
-  ///    (unless the block is partial or span 2 pages but not the entire page)
-  /// 4. This will make it easier to implement bytes for `StringArray` where we don't want each byte
-  ///    to count toward the block but instead by the number of items (`offsets.len() - 1`)
-  ///    since we are not really manage blocks - but pages
-  ///
-  /// ### Disadvantages:
-  /// 1. Harder to implement
-  /// 2. Not tracked by the global allocator
-  ///    (if you have a custom one that acts like a cgroup for memory limit, it will not count that)
-  ///
-  ///
-  ///
-  blocks: Vec<Vec<T>>,
+    /// # Implementations considerations
+    ///
+    /// ## `Vec<Vec<T>>`
+    /// The naive approach is doing `Vec<Vec<T>>`
+    ///
+    /// ### Advantages:
+    /// 1. Easy to implement
+    /// 2. Easy to reason about from a high level
+    ///
+    /// ### Disadvantages:
+    /// 1. The vecs are not contiguous in memory, so you will have:
+    ///   1. More cache misses
+    ///   2. Less prefetching optimizations
+    /// 2. Taking the first `block_size / 2` will:
+    ///   1. leave the first block with half the elements
+    ///   2. will not free the memory for the taken elements
+    ///   3. Any next taking `block_size` will require copy to combine into a single `Vec`
+    /// 3. You can't have a slice over the entire underlying data
+    ///
+    /// ## `Vec<T, MMAP>`
+    /// The more complex approach is using [`Vec`] backed by mmap
+    ///
+    /// ### Advantages:
+    /// 1. Can hold on a slice of the entire underlying data (I think)
+    /// 2. The data between blocks are contiguous in memory (I think)
+    /// 3. Allows you to take owned blocks which will free when dropped
+    ///    (unless the block is partial or span 2 pages but not the entire page)
+    /// 4. This will make it easier to implement bytes for `StringArray` where we don't want each byte
+    ///    to count toward the block but instead by the number of items (`offsets.len() - 1`)
+    ///    since we are not really manage blocks - but pages
+    ///
+    /// ### Disadvantages:
+    /// 1. Harder to implement
+    /// 2. Not tracked by the global allocator
+    ///    (if you have a custom one that acts like a cgroup for memory limit, it will not count that)
+    ///
+    ///
+    ///
+    blocks: Vec<Vec<T>>,
 
-  block_size: usize,
+    block_size: usize,
 }
 
 // We also need an implementation of `MutableBuffer`

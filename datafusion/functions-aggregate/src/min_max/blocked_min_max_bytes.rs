@@ -442,13 +442,16 @@ impl BlockedMinMaxBytesState {
         I: IntoIterator<Item = Option<&'a [u8]>>,
     {
         {
-            let to_add = total_num_groups.checked_sub(self.min_max.len()).expect("must not decrease number of rows");
+            let to_add = total_num_groups
+                .checked_sub(self.min_max.len())
+                .expect("must not decrease number of rows");
             self.min_max.push_value_n(None, to_add);
         }
         // Minimize value copies by calculating the new min/maxes for each group
         // in this batch (either the existing min/max or the new input value)
         // and updating the owned values in `self.min_maxes` at most once
-        let mut locations = HashMap::<BlocksIndex, &[u8]>::with_capacity(group_indices.len());
+        let mut locations =
+            HashMap::<BlocksIndex, &[u8]>::with_capacity(group_indices.len());
 
         // Figure out the new min value for each group
         for (new_val, group_index) in iter.into_iter().zip(group_indices.iter()) {
@@ -490,7 +493,10 @@ impl BlockedMinMaxBytesState {
     /// - `data_capacity`: the total length of all strings and their contents,
     /// - `min_maxes`: the actual min/max values for each group
     fn emit(&mut self) -> (usize, Vec<Option<Vec<u8>>>) {
-        let next_block = self.min_max.take_block().expect("must have block if called");
+        let next_block = self
+            .min_max
+            .take_block()
+            .expect("must have block if called");
 
         // reset min max reserved data
         if self.min_max.len() == 0 {
@@ -499,9 +505,9 @@ impl BlockedMinMaxBytesState {
         }
 
         let first_data_capacity: usize = next_block
-          .iter()
-          .map(|opt| opt.as_ref().map(|s| s.len()).unwrap_or(0))
-          .sum();
+            .iter()
+            .map(|opt| opt.as_ref().map(|s| s.len()).unwrap_or(0))
+            .sum();
         self.total_data_bytes -= first_data_capacity;
         (first_data_capacity, next_block)
     }

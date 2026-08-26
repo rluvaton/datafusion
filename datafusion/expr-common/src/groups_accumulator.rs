@@ -254,11 +254,23 @@ pub struct BlocksIndex {
 }
 
 impl BlocksIndex {
+    pub const MAX: Self = Self {
+        block_index: usize::MAX,
+        index_in_block: usize::MAX,
+    };
+
     pub fn new(block_index: usize, index_in_block: usize) -> Self {
         Self {
             block_index,
             index_in_block,
         }
+    }
+
+    pub fn new_in_first_block(index_in_block: usize) -> Self {
+        // Implementation note:
+        // not having From<usize> that will do this instead even when it will be more convenient
+        // so we can later change the layout to be a single usize with bit shifts
+        Self::new(0, index_in_block)
     }
 
     pub fn from_index_in_fixed_block_size(index: usize, block_size: usize) -> Self {
@@ -295,7 +307,7 @@ impl BlocksIndex {
     }
 
     pub fn add_mut_fixed(&mut self, n: usize, block_size: usize) {
-        self.block_index +=(self.index_in_block + n) / block_size;
+        self.block_index += (self.index_in_block + n) / block_size;
         self.index_in_block = (self.index_in_block + n) % block_size;
     }
 
@@ -321,8 +333,6 @@ impl BlocksIndex {
         self.index_in_block = self.index_in_block.wrapping_sub(1).min(block_size - 1);
     }
 }
-
-
 
 /// `BlocksGroupsAccumulator` implements a single aggregate (e.g. AVG) and
 /// stores the state for *all* groups internally in predefined blocks.

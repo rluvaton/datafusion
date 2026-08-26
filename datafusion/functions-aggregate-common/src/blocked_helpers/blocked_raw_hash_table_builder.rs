@@ -1,16 +1,20 @@
-use super::blocked_custom_input_builder::{Block, BlockProvider, BlockProviderFinish, BlockWithSlice, BlockedCustomInputBuilder};
+use super::blocked_custom_input_builder::{
+    Block, BlockProvider, BlockProviderFinish, BlockWithSlice, BlockedCustomInputBuilder,
+};
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::ArrowNativeType;
+use datafusion_common::utils::proxy::VecAllocExt;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use datafusion_common::utils::proxy::VecAllocExt;
 
 #[derive(Debug)]
 pub struct BlockedRawHashTableBuilder<const FIXED_BLOCK_SIZING: bool, T>(
     BlockedCustomInputBuilder<FIXED_BLOCK_SIZING, RawHashTableBlockProvider<T>>,
 );
 
-impl<const FIXED_BLOCK_SIZING: bool, T> BlockedRawHashTableBuilder<FIXED_BLOCK_SIZING, T> {
+impl<const FIXED_BLOCK_SIZING: bool, T>
+    BlockedRawHashTableBuilder<FIXED_BLOCK_SIZING, T>
+{
     pub fn new(block_size: usize) -> Self {
         BlockedRawHashTableBuilder(BlockedCustomInputBuilder::new(
             block_size,
@@ -19,18 +23,23 @@ impl<const FIXED_BLOCK_SIZING: bool, T> BlockedRawHashTableBuilder<FIXED_BLOCK_S
     }
 }
 
-impl<const FIXED_BLOCK_SIZING: bool, T> Deref for BlockedRawHashTableBuilder<FIXED_BLOCK_SIZING, T> {
-  type Target = BlockedCustomInputBuilder<FIXED_BLOCK_SIZING, RawHashTableBlockProvider<T>>;
+impl<const FIXED_BLOCK_SIZING: bool, T> Deref
+    for BlockedRawHashTableBuilder<FIXED_BLOCK_SIZING, T>
+{
+    type Target =
+        BlockedCustomInputBuilder<FIXED_BLOCK_SIZING, RawHashTableBlockProvider<T>>;
 
-  fn deref(&self) -> &Self::Target {
-    &self.0
-  }
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
-impl<const FIXED_BLOCK_SIZING: bool, T> DerefMut for BlockedRawHashTableBuilder<FIXED_BLOCK_SIZING, T> {
-  fn deref_mut(&mut self) -> &mut Self::Target {
-    &mut self.0
-  }
+impl<const FIXED_BLOCK_SIZING: bool, T> DerefMut
+    for BlockedRawHashTableBuilder<FIXED_BLOCK_SIZING, T>
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 #[derive(Debug)]
@@ -54,7 +63,7 @@ impl<T> Block for hashbrown::HashTable<T> {
     type Item = T;
 
     fn allocated_size(&self) -> usize {
-      self.allocation_size()
+        self.allocation_size()
     }
     //
     // fn push(&mut self, item: Self::Item) {

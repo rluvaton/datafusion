@@ -1,13 +1,15 @@
-use super::blocked_custom_input_builder::{Block, BlockProvider, BlockProviderFinish, BlockWithSlice, BlockedCustomInputBuilder};
+use super::blocked_custom_input_builder::{
+    Block, BlockProvider, BlockProviderFinish, BlockWithSlice, BlockedCustomInputBuilder,
+};
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::ArrowNativeType;
+use datafusion_common::utils::proxy::VecAllocExt;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use datafusion_common::utils::proxy::VecAllocExt;
 
 #[derive(Debug)]
 pub struct BlockedVecBuilder<const FIXED_BLOCK_SIZING: bool, T>(
-  BlockedCustomInputBuilder<FIXED_BLOCK_SIZING, VecBlockProvider<T>>,
+    BlockedCustomInputBuilder<FIXED_BLOCK_SIZING, VecBlockProvider<T>>,
 );
 
 impl<const FIXED_BLOCK_SIZING: bool, T> BlockedVecBuilder<FIXED_BLOCK_SIZING, T> {
@@ -19,18 +21,22 @@ impl<const FIXED_BLOCK_SIZING: bool, T> BlockedVecBuilder<FIXED_BLOCK_SIZING, T>
     }
 }
 
-impl<const FIXED_BLOCK_SIZING: bool, T> Deref for BlockedVecBuilder<FIXED_BLOCK_SIZING, T> {
-  type Target = BlockedCustomInputBuilder<FIXED_BLOCK_SIZING, VecBlockProvider<T>>;
+impl<const FIXED_BLOCK_SIZING: bool, T> Deref
+    for BlockedVecBuilder<FIXED_BLOCK_SIZING, T>
+{
+    type Target = BlockedCustomInputBuilder<FIXED_BLOCK_SIZING, VecBlockProvider<T>>;
 
-  fn deref(&self) -> &Self::Target {
-    &self.0
-  }
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
-impl<const FIXED_BLOCK_SIZING: bool, T> DerefMut for BlockedVecBuilder<FIXED_BLOCK_SIZING, T> {
-  fn deref_mut(&mut self) -> &mut Self::Target {
-    &mut self.0
-  }
+impl<const FIXED_BLOCK_SIZING: bool, T> DerefMut
+    for BlockedVecBuilder<FIXED_BLOCK_SIZING, T>
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 #[derive(Debug)]
@@ -62,7 +68,7 @@ impl<T> Block for Vec<T> {
     type Item = T;
 
     fn allocated_size(&self) -> usize {
-      VecAllocExt::allocated_size(self)
+        VecAllocExt::allocated_size(self)
     }
 
     fn push(&mut self, item: Self::Item) {

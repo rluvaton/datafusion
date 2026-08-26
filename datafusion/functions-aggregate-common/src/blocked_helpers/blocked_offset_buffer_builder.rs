@@ -1,13 +1,14 @@
 use arrow::array::OffsetSizeTrait;
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use std::collections::VecDeque;
-use std::ops::Index;
 use datafusion_common::utils::proxy::VecAllocExt;
 use datafusion_expr_common::groups_accumulator::BlocksIndex;
+use std::collections::VecDeque;
+use std::ops::Index;
 
 /// When `FIXED_BLOCK_SIZING` is true, the block size is the `Self::block_size` otherwise,
 /// the callers control the block size
-pub struct BlockedOffsetBufferBuilder<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait> {
+pub struct BlockedOffsetBufferBuilder<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
+{
     /// Using `VecDeque` so we can remove the first block and reclaim memory
     blocks: VecDeque<Vec<O>>,
 
@@ -289,8 +290,8 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
         let prev_block_size = block.len();
         let prev_block_capacity = block.capacity();
         for &index_to_copy in indexes {
-            let length =
-                offset_buffer_slice[index_to_copy] - offset_buffer_slice[index_to_copy - 1];
+            let length = offset_buffer_slice[index_to_copy]
+                - offset_buffer_slice[index_to_copy - 1];
             self.last_offset += length;
 
             block.push(self.last_offset);
@@ -323,7 +324,10 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
     ) {
         // If not fixed, then treat all offsets as single block
         if !FIXED_BLOCK_SIZING {
-            self.extends_length_from_offsets_indexes_in_current_block(offset_buffer_slice, indexes);
+            self.extends_length_from_offsets_indexes_in_current_block(
+                offset_buffer_slice,
+                indexes,
+            );
 
             return;
         }
@@ -340,7 +344,10 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
             let (to_copy, left) = indexes.split_at(to_add);
             indexes = left;
 
-            self.extends_length_from_offsets_indexes_in_current_block(offset_buffer_slice, to_copy);
+            self.extends_length_from_offsets_indexes_in_current_block(
+                offset_buffer_slice,
+                to_copy,
+            );
         }
     }
 
@@ -359,14 +366,14 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
 
         let prev_capacity = block.capacity();
 
-      if FIXED_BLOCK_SIZING {
-        assert!(
-          new_len <= self.block_size,
-          "overflow from block new block length: {new_len}, block size: {}",
-          self.block_size
-        );
-      }
-      block.resize(new_len, self.last_offset);
+        if FIXED_BLOCK_SIZING {
+            assert!(
+                new_len <= self.block_size,
+                "overflow from block new block length: {new_len}, block size: {}",
+                self.block_size
+            );
+        }
+        block.resize(new_len, self.last_offset);
 
         self.memory += (block.capacity() - prev_capacity) * size_of::<O>();
 
@@ -412,14 +419,14 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
         let mut block = &mut self.blocks[self.current_block_index];
         let new_len = block.len() + n;
 
-      if FIXED_BLOCK_SIZING {
-        assert!(
-          new_len <= self.block_size,
-          "overflow from block new block length: {new_len}, block size: {}",
-          self.block_size
-        );
-      }
-      let offset_to_add = O::usize_as(len);
+        if FIXED_BLOCK_SIZING {
+            assert!(
+                new_len <= self.block_size,
+                "overflow from block new block length: {new_len}, block size: {}",
+                self.block_size
+            );
+        }
+        let offset_to_add = O::usize_as(len);
 
         let prev_capacity = block.capacity();
         block.resize_with(new_len, || {
@@ -498,7 +505,8 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
             .expect("we verified that we have at least 1 block");
 
         self.memory -= block.capacity() * size_of::<O>();
-        self.memory -= (self.blocks.capacity() - prev_blocks_capacity) * size_of::<Vec<O>>();
+        self.memory -=
+            (self.blocks.capacity() - prev_blocks_capacity) * size_of::<Vec<O>>();
 
         self.number_of_blocks -= 1;
 
@@ -509,7 +517,8 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
             let block = vec![O::zero()];
             self.memory += block.capacity() * size_of::<O>();
             self.blocks.push_back(block);
-            self.memory += (self.blocks.capacity() - prev_blocks_capacity) * size_of::<Vec<O>>();
+            self.memory +=
+                (self.blocks.capacity() - prev_blocks_capacity) * size_of::<Vec<O>>();
         } else {
             self.current_block_index -= 1;
         }
@@ -549,8 +558,10 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait> Extend<usize>
         let mut is_first = true;
         loop {
             let remaining_in_current_block = self.current_block_remaining_len();
-            let block_finished = self
-                .extend_length_in_block(iter.by_ref().take(remaining_in_current_block), is_first);
+            let block_finished = self.extend_length_in_block(
+                iter.by_ref().take(remaining_in_current_block),
+                is_first,
+            );
 
             is_first = false;
             if !block_finished {
@@ -564,7 +575,10 @@ impl<O: OffsetSizeTrait> Index<usize> for BlockedOffsetBufferBuilder<true, O> {
     type Output = O;
 
     fn index(&self, index: usize) -> &Self::Output {
-        self.index(BlocksIndex::from_index_in_fixed_block_size(index, self.block_size))
+        self.index(BlocksIndex::from_index_in_fixed_block_size(
+            index,
+            self.block_size,
+        ))
     }
 }
 
@@ -633,7 +647,8 @@ mod tests {
         let block_size = 6;
         let lengths_to_add = vec![3; block_size];
         run_on_all_ways_to_add::<i32>(block_size, &lengths_to_add, |builder, source| {
-            let expected_offsets = OffsetBuffer::<i32>::from_lengths(lengths_to_add.clone());
+            let expected_offsets =
+                OffsetBuffer::<i32>::from_lengths(lengths_to_add.clone());
             assert_eq!(
                 builder.take_block().as_deref(),
                 Some(expected_offsets.as_ref()),
@@ -655,7 +670,8 @@ mod tests {
             .collect::<Vec<_>>();
         run_on_all_ways_to_add::<i32>(block_size, &lengths_to_add, |builder, source| {
             for length_blocked in &lengths_blocked {
-                let expected_offsets = OffsetBuffer::<i32>::from_lengths(length_blocked.clone());
+                let expected_offsets =
+                    OffsetBuffer::<i32>::from_lengths(length_blocked.clone());
                 assert_eq!(
                     builder.take_block().as_deref(),
                     Some(expected_offsets.as_ref()),
@@ -741,10 +757,14 @@ mod tests {
                 .iter()
                 .map(|index| lengths_to_add_modified[*index])
                 .collect::<Vec<_>>();
-            let offset_buffer_input = OffsetBuffer::<O>::from_lengths(lengths_to_add_modified);
+            let offset_buffer_input =
+                OffsetBuffer::<O>::from_lengths(lengths_to_add_modified);
 
             for _ in 0..2 {
-                builder.extends_length_from_offsets_in_indexes(&offset_buffer_input, &indices);
+                builder.extends_length_from_offsets_in_indexes(
+                    &offset_buffer_input,
+                    &indices,
+                );
                 on_added(&mut builder, "extends_length_from_offsets_in_indexes");
             }
         }

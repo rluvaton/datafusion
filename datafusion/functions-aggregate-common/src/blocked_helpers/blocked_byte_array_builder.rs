@@ -4,9 +4,9 @@ use super::blocked_offset_buffer_builder::BlockedOffsetBufferBuilder;
 use arrow::array::{Array, GenericByteArray, OffsetSizeTrait};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{ArrowNativeType, ByteArrayType};
+use datafusion_expr_common::groups_accumulator::BlocksIndex;
 use std::collections::VecDeque;
 use std::ops::{Deref, Index};
-use datafusion_expr_common::groups_accumulator::BlocksIndex;
 
 pub struct BlockedByteArrayBuilder<const FIXED_BLOCK_SIZING: bool, B: ByteArrayType> {
     blocked_offsets: BlockedOffsetBufferBuilder<FIXED_BLOCK_SIZING, B::Offset>,
@@ -14,7 +14,9 @@ pub struct BlockedByteArrayBuilder<const FIXED_BLOCK_SIZING: bool, B: ByteArrayT
     blocked_nulls: BlockedNullsBuilder<FIXED_BLOCK_SIZING>,
 }
 
-impl<const FIXED_BLOCK_SIZING: bool, B: ByteArrayType> BlockedByteArrayBuilder<FIXED_BLOCK_SIZING, B> {
+impl<const FIXED_BLOCK_SIZING: bool, B: ByteArrayType>
+    BlockedByteArrayBuilder<FIXED_BLOCK_SIZING, B>
+{
     pub fn new(block_size: usize) -> Self {
         assert_ne!(block_size, 0, "block size must be greater than 0");
 
@@ -36,7 +38,10 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteArrayType> BlockedByteArrayBuilder<F
     }
 
     fn block_size(&self) -> usize {
-        assert!(FIXED_BLOCK_SIZING, "block size is only available for manual block");
+        assert!(
+            FIXED_BLOCK_SIZING,
+            "block size is only available for manual block"
+        );
         self.blocked_nulls.block_size()
     }
 
@@ -67,7 +72,8 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteArrayType> BlockedByteArrayBuilder<F
             let to_add = remaining_in_current_block.min(n);
             n -= to_add;
 
-            let should_create_new_block = self.blocked_offsets.push_empty_within_block(to_add);
+            let should_create_new_block =
+                self.blocked_offsets.push_empty_within_block(to_add);
             if should_create_new_block {
                 self.blocked_bytes.start_new_block();
             }
@@ -99,7 +105,10 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteArrayType> BlockedByteArrayBuilder<F
     }
 
     pub fn start_new_block(&mut self) {
-        assert!(!FIXED_BLOCK_SIZING, "only valid when FIXED_BLOCK_SIZING is false");
+        assert!(
+            !FIXED_BLOCK_SIZING,
+            "only valid when FIXED_BLOCK_SIZING is false"
+        );
         self.blocked_bytes.start_new_block();
         self.blocked_offsets.start_new_block();
         self.blocked_nulls.start_new_block();
@@ -171,7 +180,8 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteArrayType> BlockedByteArrayBuilder<F
 
                 let offsets_in_block = &offsets[..to_add + 1];
                 offsets = &offsets[to_add..];
-                let bytes_in_block = &bytes[offsets_in_block[0].as_usize()..offsets_in_block[to_add].as_usize()];
+                let bytes_in_block = &bytes
+                    [offsets_in_block[0].as_usize()..offsets_in_block[to_add].as_usize()];
                 let null_buffer_block = null_buffer.slice(index, to_add);
                 index += to_add;
 
@@ -207,7 +217,8 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteArrayType> BlockedByteArrayBuilder<F
 
                 let offsets_in_block = &offsets[..to_add + 1];
                 offsets = &offsets[to_add..];
-                let bytes_in_block = &bytes[offsets_in_block[0].as_usize()..offsets_in_block[to_add + 1].as_usize()];
+                let bytes_in_block = &bytes[offsets_in_block[0].as_usize()
+                    ..offsets_in_block[to_add + 1].as_usize()];
 
                 self.blocked_bytes.extend_from_slice(bytes_in_block);
                 let block_finished = self

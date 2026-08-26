@@ -18,10 +18,10 @@
 //! [`Max`] and [`MaxAccumulator`] accumulator for the `max` function
 //! [`Min`] and [`MinAccumulator`] accumulator for the `min` function
 
-mod min_max_bytes;
-mod min_max_struct;
 mod blocked_min_max_bytes;
 mod blocked_min_max_struct;
+mod min_max_bytes;
+mod min_max_struct;
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::{
@@ -46,7 +46,13 @@ use arrow::datatypes::{
 
 use crate::min_max::min_max_bytes::MinMaxBytesAccumulator;
 use crate::min_max::min_max_struct::MinMaxStructAccumulator;
+use arrow::datatypes::DataType::{
+    Binary, BinaryView, Date32, Date64, Float16, Float32, Float64, Int8, Int16, Int32,
+    Int64, LargeBinary, LargeUtf8, UInt8, UInt16, UInt32, UInt64, Utf8, Utf8View,
+};
+use arrow::datatypes::TimeUnit::{Microsecond, Millisecond, Nanosecond, Second};
 use datafusion_common::ScalarValue;
+use datafusion_expr::groups_accumulator::BlockedGroupsAccumulator;
 use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Documentation, SetMonotonicity, Signature, Volatility,
     function::AccumulatorArgs,
@@ -57,9 +63,6 @@ use half::f16;
 use std::collections::VecDeque;
 use std::mem::{size_of, size_of_val};
 use std::ops::Deref;
-use arrow::datatypes::DataType::{Binary, BinaryView, Date32, Date64, Float16, Float32, Float64, Int16, Int32, Int64, Int8, LargeBinary, LargeUtf8, UInt16, UInt32, UInt64, UInt8, Utf8, Utf8View};
-use arrow::datatypes::TimeUnit::{Microsecond, Millisecond, Nanosecond, Second};
-use datafusion_expr::groups_accumulator::BlockedGroupsAccumulator;
 
 fn get_min_max_result_type(input_types: &[DataType]) -> Result<Vec<DataType>> {
     // make sure that the input types only has one element.
@@ -155,26 +158,34 @@ macro_rules! primitive_max_accumulator {
 macro_rules! blocked_primitive_max_accumulator {
     ($DATA_TYPE:ident, $NATIVE:ident, $PRIMTYPE:ident, $BLOCK_SIZE:ident) => {{
         Ok(Box::new(
-            BlockedPrimitiveGroupsAccumulator::<$PRIMTYPE, _>::new($DATA_TYPE, |cur, new| {
-                match (new).partial_cmp(cur) {
-                    Some(Ordering::Greater) | None => {
-                        // new is Greater or None
-                        *cur = new
+            BlockedPrimitiveGroupsAccumulator::<$PRIMTYPE, _>::new(
+                $DATA_TYPE,
+                |cur, new| {
+                    match (new).partial_cmp(cur) {
+                        Some(Ordering::Greater) | None => {
+                            // new is Greater or None
+                            *cur = new
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            }, $BLOCK_SIZE)
+                },
+                $BLOCK_SIZE,
+            )
             // Initialize each accumulator to $NATIVE::MIN
             .with_starting_value($NATIVE::MIN),
         ))
     }};
     ($DATA_TYPE:ident, $NATIVE:ident, $PRIMTYPE:ident, total, $BITS:ident, $BLOCK_SIZE:ident) => {{
         Ok(Box::new(
-            BlockedPrimitiveGroupsAccumulator::<$PRIMTYPE, _>::new($DATA_TYPE, |cur, new| {
-                if new.total_cmp(cur) == Ordering::Greater {
-                    *cur = new
-                }
-            }, $BLOCK_SIZE)
+            BlockedPrimitiveGroupsAccumulator::<$PRIMTYPE, _>::new(
+                $DATA_TYPE,
+                |cur, new| {
+                    if new.total_cmp(cur) == Ordering::Greater {
+                        *cur = new
+                    }
+                },
+                $BLOCK_SIZE,
+            )
             // Use the total-order minimum so negative NaNs replace the sentinel.
             .with_starting_value($NATIVE::from_bits($BITS::MAX)),
         ))
@@ -223,26 +234,34 @@ macro_rules! primitive_min_accumulator {
 macro_rules! blocked_primitive_min_accumulator {
     ($DATA_TYPE:ident, $NATIVE:ident, $PRIMTYPE:ident, $BLOCK_SIZE:ident) => {{
         Ok(Box::new(
-            BlockedPrimitiveGroupsAccumulator::<$PRIMTYPE, _>::new(&$DATA_TYPE, |cur, new| {
-                match (new).partial_cmp(cur) {
-                    Some(Ordering::Less) | None => {
-                        // new is Less or NaN
-                        *cur = new
+            BlockedPrimitiveGroupsAccumulator::<$PRIMTYPE, _>::new(
+                &$DATA_TYPE,
+                |cur, new| {
+                    match (new).partial_cmp(cur) {
+                        Some(Ordering::Less) | None => {
+                            // new is Less or NaN
+                            *cur = new
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            }, $BLOCK_SIZE)
+                },
+                $BLOCK_SIZE,
+            )
             // Initialize each accumulator to $NATIVE::MAX
             .with_starting_value($NATIVE::MAX),
         ))
     }};
     ($DATA_TYPE:ident, $NATIVE:ident, $PRIMTYPE:ident, total, $BITS:ident, $BLOCK_SIZE:ident) => {{
         Ok(Box::new(
-            BlockedPrimitiveGroupsAccumulator::<$PRIMTYPE, _>::new(&$DATA_TYPE, |cur, new| {
-                if new.total_cmp(cur) == Ordering::Less {
-                    *cur = new
-                }
-            }, $BLOCK_SIZE)
+            BlockedPrimitiveGroupsAccumulator::<$PRIMTYPE, _>::new(
+                &$DATA_TYPE,
+                |cur, new| {
+                    if new.total_cmp(cur) == Ordering::Less {
+                        *cur = new
+                    }
+                },
+                $BLOCK_SIZE,
+            )
             // Use the total-order maximum so positive NaNs replace the sentinel.
             .with_starting_value($NATIVE::from_bits($BITS::MAX >> 1)),
         ))
@@ -478,75 +497,199 @@ impl AggregateUDFImpl for Max {
         let data_type = args.return_field.data_type();
         let block_size = args.block_size;
         match data_type {
-            Int8 => blocked_primitive_max_accumulator!(data_type, i8, Int8Type, block_size),
-            Int16 => blocked_primitive_max_accumulator!(data_type, i16, Int16Type, block_size),
-            Int32 => blocked_primitive_max_accumulator!(data_type, i32, Int32Type, block_size),
-            Int64 => blocked_primitive_max_accumulator!(data_type, i64, Int64Type, block_size),
-            UInt8 => blocked_primitive_max_accumulator!(data_type, u8, UInt8Type, block_size),
-            UInt16 => blocked_primitive_max_accumulator!(data_type, u16, UInt16Type, block_size),
-            UInt32 => blocked_primitive_max_accumulator!(data_type, u32, UInt32Type, block_size),
-            UInt64 => blocked_primitive_max_accumulator!(data_type, u64, UInt64Type, block_size),
+            Int8 => {
+                blocked_primitive_max_accumulator!(data_type, i8, Int8Type, block_size)
+            }
+            Int16 => {
+                blocked_primitive_max_accumulator!(data_type, i16, Int16Type, block_size)
+            }
+            Int32 => {
+                blocked_primitive_max_accumulator!(data_type, i32, Int32Type, block_size)
+            }
+            Int64 => {
+                blocked_primitive_max_accumulator!(data_type, i64, Int64Type, block_size)
+            }
+            UInt8 => {
+                blocked_primitive_max_accumulator!(data_type, u8, UInt8Type, block_size)
+            }
+            UInt16 => {
+                blocked_primitive_max_accumulator!(data_type, u16, UInt16Type, block_size)
+            }
+            UInt32 => {
+                blocked_primitive_max_accumulator!(data_type, u32, UInt32Type, block_size)
+            }
+            UInt64 => {
+                blocked_primitive_max_accumulator!(data_type, u64, UInt64Type, block_size)
+            }
             Float16 => {
-                blocked_primitive_max_accumulator!(data_type, f16, Float16Type, total, u16, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    f16,
+                    Float16Type,
+                    total,
+                    u16,
+                    block_size
+                )
             }
             Float32 => {
-                blocked_primitive_max_accumulator!(data_type, f32, Float32Type, total, u32, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    f32,
+                    Float32Type,
+                    total,
+                    u32,
+                    block_size
+                )
             }
             Float64 => {
-                blocked_primitive_max_accumulator!(data_type, f64, Float64Type, total, u64, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    f64,
+                    Float64Type,
+                    total,
+                    u64,
+                    block_size
+                )
             }
-            Date32 => blocked_primitive_max_accumulator!(data_type, i32, Date32Type, block_size),
-            Date64 => blocked_primitive_max_accumulator!(data_type, i64, Date64Type, block_size),
+            Date32 => {
+                blocked_primitive_max_accumulator!(data_type, i32, Date32Type, block_size)
+            }
+            Date64 => {
+                blocked_primitive_max_accumulator!(data_type, i64, Date64Type, block_size)
+            }
             Time32(Second) => {
-                blocked_primitive_max_accumulator!(data_type, i32, Time32SecondType, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i32,
+                    Time32SecondType,
+                    block_size
+                )
             }
             Time32(Millisecond) => {
-                blocked_primitive_max_accumulator!(data_type, i32, Time32MillisecondType, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i32,
+                    Time32MillisecondType,
+                    block_size
+                )
             }
             Time64(Microsecond) => {
-                blocked_primitive_max_accumulator!(data_type, i64, Time64MicrosecondType, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i64,
+                    Time64MicrosecondType,
+                    block_size
+                )
             }
             Time64(Nanosecond) => {
-                blocked_primitive_max_accumulator!(data_type, i64, Time64NanosecondType, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i64,
+                    Time64NanosecondType,
+                    block_size
+                )
             }
             Timestamp(Second, _) => {
-                blocked_primitive_max_accumulator!(data_type, i64, TimestampSecondType, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i64,
+                    TimestampSecondType,
+                    block_size
+                )
             }
             Timestamp(Millisecond, _) => {
-                blocked_primitive_max_accumulator!(data_type, i64, TimestampMillisecondType, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i64,
+                    TimestampMillisecondType,
+                    block_size
+                )
             }
             Timestamp(Microsecond, _) => {
-                blocked_primitive_max_accumulator!(data_type, i64, TimestampMicrosecondType, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i64,
+                    TimestampMicrosecondType,
+                    block_size
+                )
             }
             Timestamp(Nanosecond, _) => {
-                blocked_primitive_max_accumulator!(data_type, i64, TimestampNanosecondType, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i64,
+                    TimestampNanosecondType,
+                    block_size
+                )
             }
             Duration(Second) => {
-                blocked_primitive_max_accumulator!(data_type, i64, DurationSecondType, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i64,
+                    DurationSecondType,
+                    block_size
+                )
             }
             Duration(Millisecond) => {
-                blocked_primitive_max_accumulator!(data_type, i64, DurationMillisecondType, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i64,
+                    DurationMillisecondType,
+                    block_size
+                )
             }
             Duration(Microsecond) => {
-                blocked_primitive_max_accumulator!(data_type, i64, DurationMicrosecondType, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i64,
+                    DurationMicrosecondType,
+                    block_size
+                )
             }
             Duration(Nanosecond) => {
-                blocked_primitive_max_accumulator!(data_type, i64, DurationNanosecondType, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i64,
+                    DurationNanosecondType,
+                    block_size
+                )
             }
             Decimal32(_, _) => {
-                blocked_primitive_max_accumulator!(data_type, i32, Decimal32Type, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i32,
+                    Decimal32Type,
+                    block_size
+                )
             }
             Decimal64(_, _) => {
-                blocked_primitive_max_accumulator!(data_type, i64, Decimal64Type, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i64,
+                    Decimal64Type,
+                    block_size
+                )
             }
             Decimal128(_, _) => {
-                blocked_primitive_max_accumulator!(data_type, i128, Decimal128Type, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i128,
+                    Decimal128Type,
+                    block_size
+                )
             }
             Decimal256(_, _) => {
-                blocked_primitive_max_accumulator!(data_type, i256, Decimal256Type, block_size)
+                blocked_primitive_max_accumulator!(
+                    data_type,
+                    i256,
+                    Decimal256Type,
+                    block_size
+                )
             }
             Utf8 | LargeUtf8 | Utf8View | Binary | LargeBinary | BinaryView => {
-                Ok(Box::new(MinMaxBytesBlockedAccumulator::new_max(data_type.clone(), block_size)))
+                Ok(Box::new(MinMaxBytesBlockedAccumulator::new_max(
+                    data_type.clone(),
+                    block_size,
+                )))
             }
             Struct(_) => Ok(Box::new(MinMaxStructAccumulator::new_max(
                 data_type.clone(),
@@ -1220,10 +1363,10 @@ make_udaf_expr_and_func!(
 );
 
 // Re-export accumulators from the common module for backwards compatibility
+use crate::min_max::blocked_min_max_bytes::MinMaxBytesBlockedAccumulator;
 pub use datafusion_functions_aggregate_common::min_max::{
     MaxAccumulator, MinAccumulator,
 };
-use crate::min_max::blocked_min_max_bytes::MinMaxBytesBlockedAccumulator;
 
 #[cfg(test)]
 mod tests {

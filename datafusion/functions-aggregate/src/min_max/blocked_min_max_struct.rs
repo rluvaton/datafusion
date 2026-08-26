@@ -31,8 +31,8 @@ use datafusion_expr::{EmitTo, GroupsAccumulator};
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::nulls::apply_filter_as_nulls;
 
 use datafusion_common::utils::split_vec_min_alloc;
-use datafusion_expr::groups_accumulator::{BlockedGroupsAccumulator, BlocksIndex};
 use datafusion_expr::groups_accumulator::enumerate_blocked::EnumerateBlockedIteratorExt;
+use datafusion_expr::groups_accumulator::{BlockedGroupsAccumulator, BlocksIndex};
 use datafusion_functions_aggregate_common::blocked_helpers::BlockedVecBuilder;
 
 /// Accumulator for MIN/MAX operations on Struct data types.
@@ -223,9 +223,9 @@ impl BlockedMinMaxStructState {
         F: FnMut(&StructArray, &StructArray) -> bool + Send + Sync,
     {
         {
-            let to_add = total_num_groups.checked_sub(self.min_max.len()).ok_or_else(|| {
-                internal_err!("must only increase")
-            })?;
+            let to_add = total_num_groups
+                .checked_sub(self.min_max.len())
+                .ok_or_else(|| internal_err!("must only increase"))?;
 
             self.min_max.push_value_n(None, to_add);
         }
@@ -283,7 +283,10 @@ impl BlockedMinMaxStructState {
     /// - `data_capacity`: the total length of all strings and their contents,
     /// - `min_maxes`: the actual min/max values for each group
     fn emit_to(&mut self) -> (usize, Vec<Option<StructArray>>) {
-        let next_block = self.min_max.take_block().expect("must have block if called");
+        let next_block = self
+            .min_max
+            .take_block()
+            .expect("must have block if called");
 
         // reset min max reserved data
         if self.min_max.len() == 0 {
@@ -292,9 +295,9 @@ impl BlockedMinMaxStructState {
         }
 
         let first_data_capacity: usize = next_block
-          .iter()
-          .map(|opt| opt.as_ref().map(|s| s.len()).unwrap_or(0))
-          .sum();
+            .iter()
+            .map(|opt| opt.as_ref().map(|s| s.len()).unwrap_or(0))
+            .sum();
         self.total_data_bytes -= first_data_capacity;
         (first_data_capacity, next_block)
     }

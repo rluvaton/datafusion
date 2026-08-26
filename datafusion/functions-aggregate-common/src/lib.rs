@@ -34,6 +34,7 @@
 
 pub mod accumulator;
 pub mod aggregate;
+pub mod blocked_helpers;
 pub mod merge_arrays;
 pub mod min_max;
 pub mod noop_accumulator;
@@ -41,4 +42,3 @@ pub mod order;
 pub mod stats;
 pub mod tdigest;
 pub mod utils;
-pub mod blocked_helpers;

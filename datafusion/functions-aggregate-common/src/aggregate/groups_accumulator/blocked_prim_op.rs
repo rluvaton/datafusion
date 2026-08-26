@@ -18,15 +18,17 @@
 use std::mem::size_of;
 use std::sync::Arc;
 
+use super::accumulate::{BlockedNullState, NullState};
+use crate::blocked_helpers::BlockedVecBuilder;
 use arrow::array::{ArrayRef, AsArray, BooleanArray, PrimitiveArray};
 use arrow::buffer::NullBuffer;
 use arrow::compute;
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::datatypes::DataType;
-use datafusion_common::{internal_datafusion_err, internal_err, DataFusionError, Result};
-use datafusion_expr_common::groups_accumulator::{BlockedGroupsAccumulator, BlocksIndex, EmitTo, GroupsAccumulator};
-use crate::blocked_helpers::BlockedVecBuilder;
-use super::accumulate::{BlockedNullState, NullState};
+use datafusion_common::{DataFusionError, Result, internal_datafusion_err, internal_err};
+use datafusion_expr_common::groups_accumulator::{
+    BlockedGroupsAccumulator, BlocksIndex, EmitTo, GroupsAccumulator,
+};
 
 /// An accumulator that implements a single operation over
 /// [`ArrowPrimitiveType`] where the accumulated state is the same as
@@ -116,9 +118,10 @@ where
     }
 
     fn evaluate(&mut self) -> Result<ArrayRef> {
-        let values = self.values.take_block_finished().ok_or_else(|| {
-            internal_err!("must have block if called")
-        })?;
+        let values = self
+            .values
+            .take_block_finished()
+            .ok_or_else(|| internal_err!("must have block if called"))?;
         let nulls = self.null_state.build();
         let values = PrimitiveArray::<T>::new(values, nulls) // no copy
             .with_data_type(self.data_type.clone());

@@ -17,13 +17,15 @@
 
 use std::sync::Arc;
 
+use super::accumulate::{BlockedNullState, NullState};
 use crate::aggregate::groups_accumulator::nulls::filtered_null_mask;
+use crate::blocked_helpers::BlockedBooleanBuilder;
 use arrow::array::{ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder};
 use arrow::buffer::BooleanBuffer;
-use datafusion_common::{internal_err, Result};
-use datafusion_expr_common::groups_accumulator::{BlockedGroupsAccumulator, BlocksIndex, EmitTo, GroupsAccumulator};
-use crate::blocked_helpers::BlockedBooleanBuilder;
-use super::accumulate::{BlockedNullState, NullState};
+use datafusion_common::{Result, internal_err};
+use datafusion_expr_common::groups_accumulator::{
+    BlockedGroupsAccumulator, BlocksIndex, EmitTo, GroupsAccumulator,
+};
 
 /// An accumulator that implements a single operation over a
 /// [`BooleanArray`] where the accumulated state is also boolean (such
@@ -105,9 +107,10 @@ where
     }
 
     fn evaluate(&mut self) -> Result<ArrayRef> {
-        let values = self.values.take_block().ok_or_else(|| {
-            internal_err!("must have a block if called")
-        })?;
+        let values = self
+            .values
+            .take_block()
+            .ok_or_else(|| internal_err!("must have a block if called"))?;
 
         let nulls = self.null_state.build();
         let values = BooleanArray::new(values, nulls);

@@ -41,6 +41,7 @@ use datafusion_common::{
     Result, ScalarValue, assert_eq_or_internal_err, exec_err, internal_err,
 };
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
+use datafusion_expr::groups_accumulator::{BlockedGroupsAccumulator, BlocksIndex};
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Documentation, EmitTo, GroupsAccumulator, Signature,
@@ -53,7 +54,6 @@ use datafusion_functions_aggregate_common::utils::ordering_fields;
 use datafusion_macros::user_doc;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use hashbrown::hash_table::HashTable;
-use datafusion_expr::groups_accumulator::{BlockedGroupsAccumulator, BlocksIndex};
 
 make_udaf_expr_and_func!(
     ArrayAgg,
@@ -627,14 +627,14 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
         for (row_idx, &group_idx) in group_indices.iter().enumerate() {
             // Skip filtered rows
             if let Some(filter) = opt_filter
-              && (filter.is_null(row_idx) || !filter.value(row_idx))
+                && (filter.is_null(row_idx) || !filter.value(row_idx))
             {
                 continue;
             }
 
             // Skip null values when ignore_nulls is set
             if let Some(ref nulls) = nulls
-              && nulls.is_null(row_idx)
+                && nulls.is_null(row_idx)
             {
                 continue;
             }
@@ -712,7 +712,7 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
             }
 
             let sources: Vec<&dyn Array> =
-              self.batches.iter().map(|b| b.as_ref()).collect();
+                self.batches.iter().map(|b| b.as_ref()).collect();
             arrow::compute::interleave(&sources, &interleave_indices)?
         };
 
@@ -800,16 +800,16 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
     }
     fn size(&self) -> usize {
         self.batches
-          .iter()
-          .map(|arr| arr.to_data().get_slice_memory_size().unwrap_or_default())
-          .sum::<usize>()
-          + self.batches.capacity() * size_of::<ArrayRef>()
-          + self
-          .batch_entries
-          .iter()
-          .map(|e| e.capacity() * size_of::<(u32, u32)>())
-          .sum::<usize>()
-          + self.batch_entries.capacity() * size_of::<Vec<(u32, u32)>>()
+            .iter()
+            .map(|arr| arr.to_data().get_slice_memory_size().unwrap_or_default())
+            .sum::<usize>()
+            + self.batches.capacity() * size_of::<ArrayRef>()
+            + self
+                .batch_entries
+                .iter()
+                .map(|e| e.capacity() * size_of::<(u32, u32)>())
+                .sum::<usize>()
+            + self.batch_entries.capacity() * size_of::<Vec<(u32, u32)>>()
     }
 }
 
@@ -946,14 +946,14 @@ impl BlockedGroupsAccumulator for ArrayAggBlockedGroupsAccumulator {
         for (row_idx, &group_idx) in group_indices.iter().enumerate() {
             // Skip filtered rows
             if let Some(filter) = opt_filter
-              && (filter.is_null(row_idx) || !filter.value(row_idx))
+                && (filter.is_null(row_idx) || !filter.value(row_idx))
             {
                 continue;
             }
 
             // Skip null values when ignore_nulls is set
             if let Some(ref nulls) = nulls
-              && nulls.is_null(row_idx)
+                && nulls.is_null(row_idx)
             {
                 continue;
             }
@@ -1031,7 +1031,7 @@ impl BlockedGroupsAccumulator for ArrayAggBlockedGroupsAccumulator {
             }
 
             let sources: Vec<&dyn Array> =
-              self.batches.iter().map(|b| b.as_ref()).collect();
+                self.batches.iter().map(|b| b.as_ref()).collect();
             arrow::compute::interleave(&sources, &interleave_indices)?
         };
 
@@ -1119,16 +1119,16 @@ impl BlockedGroupsAccumulator for ArrayAggBlockedGroupsAccumulator {
     }
     fn size(&self) -> usize {
         self.batches
-          .iter()
-          .map(|arr| arr.to_data().get_slice_memory_size().unwrap_or_default())
-          .sum::<usize>()
-          + self.batches.capacity() * size_of::<ArrayRef>()
-          + self
-          .batch_entries
-          .iter()
-          .map(|e| e.capacity() * size_of::<(u32, u32)>())
-          .sum::<usize>()
-          + self.batch_entries.capacity() * size_of::<Vec<(u32, u32)>>()
+            .iter()
+            .map(|arr| arr.to_data().get_slice_memory_size().unwrap_or_default())
+            .sum::<usize>()
+            + self.batches.capacity() * size_of::<ArrayRef>()
+            + self
+                .batch_entries
+                .iter()
+                .map(|e| e.capacity() * size_of::<(u32, u32)>())
+                .sum::<usize>()
+            + self.batch_entries.capacity() * size_of::<Vec<(u32, u32)>>()
     }
 }
 

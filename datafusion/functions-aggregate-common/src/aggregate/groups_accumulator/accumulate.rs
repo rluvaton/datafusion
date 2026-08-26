@@ -24,8 +24,8 @@ use arrow::buffer::NullBuffer;
 use arrow::datatypes::ArrowPrimitiveType;
 
 use crate::aggregate::groups_accumulator::nulls::filter_to_validity;
-use datafusion_expr_common::groups_accumulator::{BlocksIndex, EmitTo};
 use crate::blocked_helpers::BlockedBooleanBuilder;
+use datafusion_expr_common::groups_accumulator::{BlocksIndex, EmitTo};
 
 /// If the input has nulls, then the accumulator must potentially
 /// handle each input null value specially (e.g. for `SUM` to mark the
@@ -116,9 +116,15 @@ impl BlockedSeenValues {
     ///
     /// The builder is then ensured to have at least `total_num_groups` length,
     /// with any new entries initialized to false.
-    fn get_builder(&mut self, total_num_groups: usize) -> &mut BlockedBooleanBuilder<true> {
+    fn get_builder(
+        &mut self,
+        total_num_groups: usize,
+    ) -> &mut BlockedBooleanBuilder<true> {
         match self {
-            Self::All { num_values, block_size } => {
+            Self::All {
+                num_values,
+                block_size,
+            } => {
                 let mut builder = BlockedBooleanBuilder::<true>::new(*block_size);
                 builder.append_n(*num_values, true);
                 if total_num_groups > *num_values {
@@ -429,7 +435,10 @@ pub struct BlockedNullState {
 impl BlockedNullState {
     pub fn new(block_size: usize) -> Self {
         Self {
-            seen_values: BlockedSeenValues::All { num_values: 0, block_size },
+            seen_values: BlockedSeenValues::All {
+                num_values: 0,
+                block_size,
+            },
         }
     }
 
@@ -465,13 +474,13 @@ impl BlockedNullState {
         total_num_groups: usize,
         mut value_fn: F,
     ) where
-      T: ArrowPrimitiveType + Send,
-      F: FnMut(BlocksIndex, T::Native) + Send,
+        T: ArrowPrimitiveType + Send,
+        F: FnMut(BlocksIndex, T::Native) + Send,
     {
         // skip null handling if no nulls in input or accumulator
         if let BlockedSeenValues::All { num_values, .. } = &mut self.seen_values
-          && opt_filter.is_none()
-          && values.null_count() == 0
+            && opt_filter.is_none()
+            && values.null_count() == 0
         {
             accumulate(group_indices, values, None, value_fn);
             *num_values = total_num_groups;
@@ -503,20 +512,20 @@ impl BlockedNullState {
         total_num_groups: usize,
         mut value_fn: F,
     ) where
-      F: FnMut(BlocksIndex, bool) + Send,
+        F: FnMut(BlocksIndex, bool) + Send,
     {
         let data = values.values();
         assert_eq!(data.len(), group_indices.len());
 
         // skip null handling if no nulls in input or accumulator
         if let BlockedSeenValues::All { num_values, .. } = &mut self.seen_values
-          && opt_filter.is_none()
-          && values.null_count() == 0
+            && opt_filter.is_none()
+            && values.null_count() == 0
         {
             group_indices
-              .iter()
-              .zip(data.iter())
-              .for_each(|(&group_index, new_value)| value_fn(group_index, new_value));
+                .iter()
+                .zip(data.iter())
+                .for_each(|(&group_index, new_value)| value_fn(group_index, new_value));
             *num_values = total_num_groups;
 
             return;
@@ -541,46 +550,46 @@ impl BlockedNullState {
             (true, None) => {
                 let nulls = values.nulls().unwrap();
                 group_indices
-                  .iter()
-                  .zip(data.iter())
-                  .zip(nulls.iter())
-                  .for_each(|((&group_index, new_value), is_valid)| {
-                      if is_valid {
-                          seen_values.set_bit(group_index, true);
-                          value_fn(group_index, new_value);
-                      }
-                  })
+                    .iter()
+                    .zip(data.iter())
+                    .zip(nulls.iter())
+                    .for_each(|((&group_index, new_value), is_valid)| {
+                        if is_valid {
+                            seen_values.set_bit(group_index, true);
+                            value_fn(group_index, new_value);
+                        }
+                    })
             }
             // no nulls, but a filter
             (false, Some(filter)) => {
                 assert_eq!(filter.len(), group_indices.len());
 
                 group_indices
-                  .iter()
-                  .zip(data.iter())
-                  .zip(filter.iter())
-                  .for_each(|((&group_index, new_value), filter_value)| {
-                      if filter_value == Some(true) {
-                          seen_values.set_bit(group_index, true);
-                          value_fn(group_index, new_value);
-                      }
-                  })
+                    .iter()
+                    .zip(data.iter())
+                    .zip(filter.iter())
+                    .for_each(|((&group_index, new_value), filter_value)| {
+                        if filter_value == Some(true) {
+                            seen_values.set_bit(group_index, true);
+                            value_fn(group_index, new_value);
+                        }
+                    })
             }
             // both null values and filters
             (true, Some(filter)) => {
                 assert_eq!(filter.len(), group_indices.len());
                 filter
-                  .iter()
-                  .zip(group_indices.iter())
-                  .zip(values.iter())
-                  .for_each(|((filter_value, &group_index), new_value)| {
-                      if filter_value == Some(true)
-                        && let Some(new_value) = new_value
-                      {
-                          seen_values.set_bit(group_index, true);
-                          value_fn(group_index, new_value)
-                      }
-                  })
+                    .iter()
+                    .zip(group_indices.iter())
+                    .zip(values.iter())
+                    .for_each(|((filter_value, &group_index), new_value)| {
+                        if filter_value == Some(true)
+                            && let Some(new_value) = new_value
+                        {
+                            seen_values.set_bit(group_index, true);
+                            value_fn(group_index, new_value)
+                        }
+                    })
             }
         }
     }
@@ -592,7 +601,10 @@ impl BlockedNullState {
     /// resets the internal state appropriately
     pub fn build(&mut self) -> Option<NullBuffer> {
         match &mut self.seen_values {
-            BlockedSeenValues::All { num_values, block_size } => {
+            BlockedSeenValues::All {
+                num_values,
+                block_size,
+            } => {
                 *num_values = num_values.saturating_sub(*block_size);
                 None
             }

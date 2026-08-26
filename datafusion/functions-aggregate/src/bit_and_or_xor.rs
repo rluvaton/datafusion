@@ -71,15 +71,27 @@ macro_rules! blocked_group_accumulator_helper {
     ($t:ty, $dt:expr, $opr:expr, $block_size:expr) => {
         match $opr {
             BitwiseOperationType::And => Ok(Box::new(
-                BlockedPrimitiveGroupsAccumulator::<$t, _>::new($dt, |x, y| x.bitand_assign(y), $block_size)
-                    .with_starting_value(!0),
+                BlockedPrimitiveGroupsAccumulator::<$t, _>::new(
+                    $dt,
+                    |x, y| x.bitand_assign(y),
+                    $block_size,
+                )
+                .with_starting_value(!0),
             )),
-            BitwiseOperationType::Or => Ok(Box::new(
-                BlockedPrimitiveGroupsAccumulator::<$t, _>::new($dt, |x, y| x.bitor_assign(y), $block_size),
-            )),
-            BitwiseOperationType::Xor => Ok(Box::new(
-                BlockedPrimitiveGroupsAccumulator::<$t, _>::new($dt, |x, y| x.bitxor_assign(y), $block_size),
-            )),
+            BitwiseOperationType::Or => {
+                Ok(Box::new(BlockedPrimitiveGroupsAccumulator::<$t, _>::new(
+                    $dt,
+                    |x, y| x.bitor_assign(y),
+                    $block_size,
+                )))
+            }
+            BitwiseOperationType::Xor => {
+                Ok(Box::new(BlockedPrimitiveGroupsAccumulator::<$t, _>::new(
+                    $dt,
+                    |x, y| x.bitxor_assign(y),
+                    $block_size,
+                )))
+            }
         }
     };
 }
@@ -335,7 +347,10 @@ impl AggregateUDFImpl for BitwiseOperation {
         true
     }
 
-    fn create_blocked_groups_accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn BlockedGroupsAccumulator>> {
+    fn create_blocked_groups_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn BlockedGroupsAccumulator>> {
         let data_type = args.return_field.data_type();
         let operation = &self.operation;
         let block_size = args.block_size;
@@ -347,7 +362,6 @@ impl AggregateUDFImpl for BitwiseOperation {
                 data_type
             ),
         }
-
     }
 
     fn reverse_expr(&self) -> ReversedUDAF {
