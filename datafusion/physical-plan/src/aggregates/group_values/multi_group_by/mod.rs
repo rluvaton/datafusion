@@ -54,6 +54,7 @@ use datafusion_expr::EmitTo;
 use datafusion_physical_expr::binary_map::OutputType;
 
 use hashbrown::hash_table::HashTable;
+use datafusion_expr_common::groups_accumulator::BlocksIndex;
 
 const NON_INLINED_FLAG: u64 = 0x8000000000000000;
 const VALUE_MASK: u64 = 0x7FFFFFFFFFFFFFFF;
@@ -65,12 +66,12 @@ const VALUE_MASK: u64 = 0x7FFFFFFFFFFFFFFF;
 /// incoming rows.
 ///
 /// [`GroupValuesColumn`]: crate::aggregates::group_values::GroupValuesColumn
-pub trait GroupColumn: Send + Sync {
+pub trait GroupColumn<const FIXED_BLOCK_SIZING: bool>: Send + Sync {
     /// Returns equal if the row stored in this builder at `lhs_row` is equal to
     /// the row in `array` at `rhs_row`
     ///
     /// Note that this comparison returns true if both elements are NULL
-    fn equal_to(&self, lhs_row: usize, array: &ArrayRef, rhs_row: usize) -> bool;
+    fn equal_to(&self, lhs_row: BlocksIndex, array: &ArrayRef, rhs_row: usize) -> bool;
 
     /// Appends the row at `row` in `array` to this builder
     fn append_val(&mut self, array: &ArrayRef, row: usize) -> Result<()>;
@@ -86,7 +87,7 @@ pub trait GroupColumn: Send + Sync {
     /// `false`, the check for nth row will be skipped.
     fn vectorized_equal_to(
         &self,
-        lhs_rows: &[usize],
+        lhs_rows: &[BlocksIndex],
         array: &ArrayRef,
         rhs_rows: &[usize],
         equal_to_results: &mut BooleanBufferBuilder,
@@ -106,12 +107,17 @@ pub trait GroupColumn: Send + Sync {
     /// Returns the number of bytes used by this [`GroupColumn`]
     fn size(&self) -> usize;
 
-    /// Builds a new array from all of the stored rows
-    fn build(self: Box<Self>) -> ArrayRef;
+    // /// Builds a new array from all of the stored rows
+    // fn build(self: Box<Self>) -> ArrayRef;
+    //
+    // /// Builds a new array from the first `n` stored rows, shifting the
+    // /// remaining rows to the start of the builder
+    // fn take_n(&mut self, n: usize) -> ArrayRef;
 
-    /// Builds a new array from the first `n` stored rows, shifting the
-    /// remaining rows to the start of the builder
-    fn take_n(&mut self, n: usize) -> ArrayRef;
+    /// Take the next block
+    fn take_block(&mut self) -> Option<ArrayRef>;
+
+    fn start_new_block(&mut self);
 }
 
 /// Determines if the nullability of the existing and new input array can be used
@@ -220,7 +226,7 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     /// <https://github.com/apache/datafusion/pull/12269>
     ///
     /// [`GroupValuesRows`]: crate::aggregates::group_values::GroupValuesRows
-    group_values: Vec<Box<dyn GroupColumn>>,
+    group_values: Vec<Box<dyn GroupColumn<true>>>,
 
     /// reused buffer to store hashes
     hashes_buffer: Vec<u64>,
@@ -910,12 +916,12 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
 /// `$nullable`: whether the input can contains nulls
 /// `$t`: the primitive type of the builder
 macro_rules! instantiate_primitive {
-    ($v:expr, $nullable:expr, $t:ty, $data_type:ident) => {
+     ($FIXED_BLOCK_SIZE: ident, $block_size: expr, $v:expr, $nullable:expr, $t:ty, $data_type:ident) => {
         if $nullable {
-            let b = PrimitiveGroupValueBuilder::<$t, true>::new($data_type.to_owned());
+            let b = PrimitiveGroupValueBuilder::<$FIXED_BLOCK_SIZE, $t, true>::new($data_type.to_owned(), $block_size);
             $v.push(Box::new(b) as _)
         } else {
-            let b = PrimitiveGroupValueBuilder::<$t, false>::new($data_type.to_owned());
+            let b = PrimitiveGroupValueBuilder::<$FIXED_BLOCK_SIZE, $t, false>::new($data_type.to_owned(), $block_size);
             $v.push(Box::new(b) as _)
         }
     };
@@ -998,36 +1004,36 @@ fn group_column_supported_type(data_type: &DataType) -> bool {
 ///
 /// The allow-list that gates this dispatcher lives in
 /// [`group_column_supported_type`] directly above.
-fn make_group_column(field: &Field) -> Result<Box<dyn GroupColumn>> {
+fn make_group_column<const IS_FIXED_BLOCK_SIZING: bool>(field: &Field, block_size: usize) -> Result<Box<dyn GroupColumn<IS_FIXED_BLOCK_SIZING>>> {
+    if IS_FIXED_BLOCK_SIZING {
+        assert_ne!(block_size, 0);
+    }
     let nullable = field.is_nullable();
     let data_type = field.data_type();
-    let mut v: Vec<Box<dyn GroupColumn>> = Vec::with_capacity(1);
+    let mut v: Vec<Box<dyn GroupColumn<IS_FIXED_BLOCK_SIZING>>> = Vec::with_capacity(1);
     match *data_type {
-        DataType::Int8 => instantiate_primitive!(v, nullable, Int8Type, data_type),
-        DataType::Int16 => instantiate_primitive!(v, nullable, Int16Type, data_type),
-        DataType::Int32 => instantiate_primitive!(v, nullable, Int32Type, data_type),
-        DataType::Int64 => instantiate_primitive!(v, nullable, Int64Type, data_type),
-        DataType::UInt8 => instantiate_primitive!(v, nullable, UInt8Type, data_type),
-        DataType::UInt16 => instantiate_primitive!(v, nullable, UInt16Type, data_type),
-        DataType::UInt32 => instantiate_primitive!(v, nullable, UInt32Type, data_type),
-        DataType::UInt64 => instantiate_primitive!(v, nullable, UInt64Type, data_type),
-        DataType::Float16 => {
-            instantiate_primitive!(v, nullable, Float16Type, data_type)
-        }
+        DataType::Int8 => instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, Int8Type, data_type),
+        DataType::Int16 => instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, Int16Type, data_type),
+        DataType::Int32 => instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, Int32Type, data_type),
+        DataType::Int64 => instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, Int64Type, data_type),
+        DataType::UInt8 => instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, UInt8Type, data_type),
+        DataType::UInt16 => instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, UInt16Type, data_type),
+        DataType::UInt32 => instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, UInt32Type, data_type),
+        DataType::UInt64 => instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, UInt64Type, data_type),
         DataType::Float32 => {
-            instantiate_primitive!(v, nullable, Float32Type, data_type)
+            instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, Float32Type, data_type)
         }
         DataType::Float64 => {
-            instantiate_primitive!(v, nullable, Float64Type, data_type)
+            instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, Float64Type, data_type)
         }
-        DataType::Date32 => instantiate_primitive!(v, nullable, Date32Type, data_type),
-        DataType::Date64 => instantiate_primitive!(v, nullable, Date64Type, data_type),
+        DataType::Date32 => instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, Date32Type, data_type),
+        DataType::Date64 => instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, Date64Type, data_type),
         DataType::Time32(t) => match t {
             TimeUnit::Second => {
-                instantiate_primitive!(v, nullable, Time32SecondType, data_type)
+                instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, Time32SecondType, data_type)
             }
             TimeUnit::Millisecond => {
-                instantiate_primitive!(v, nullable, Time32MillisecondType, data_type)
+                instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, Time32MillisecondType, data_type)
             }
             // Time32 with Microsecond / Nanosecond is not a valid Arrow type
             // combination; reject explicitly so group_column_supported_type
@@ -1036,10 +1042,10 @@ fn make_group_column(field: &Field) -> Result<Box<dyn GroupColumn>> {
         },
         DataType::Time64(t) => match t {
             TimeUnit::Microsecond => {
-                instantiate_primitive!(v, nullable, Time64MicrosecondType, data_type)
+                instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, Time64MicrosecondType, data_type)
             }
             TimeUnit::Nanosecond => {
-                instantiate_primitive!(v, nullable, Time64NanosecondType, data_type)
+                instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, Time64NanosecondType, data_type)
             }
             // Time64 with Second / Millisecond is not a valid Arrow type
             // combination; reject explicitly.
@@ -1047,69 +1053,43 @@ fn make_group_column(field: &Field) -> Result<Box<dyn GroupColumn>> {
         },
         DataType::Timestamp(t, _) => match t {
             TimeUnit::Second => {
-                instantiate_primitive!(v, nullable, TimestampSecondType, data_type)
+                instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, TimestampSecondType, data_type)
             }
             TimeUnit::Millisecond => {
-                instantiate_primitive!(v, nullable, TimestampMillisecondType, data_type)
+                instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, TimestampMillisecondType, data_type)
             }
             TimeUnit::Microsecond => {
-                instantiate_primitive!(v, nullable, TimestampMicrosecondType, data_type)
+                instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, TimestampMicrosecondType, data_type)
             }
             TimeUnit::Nanosecond => {
-                instantiate_primitive!(v, nullable, TimestampNanosecondType, data_type)
-            }
-        },
-        DataType::Duration(t) => match t {
-            TimeUnit::Second => {
-                instantiate_primitive!(v, nullable, DurationSecondType, data_type)
-            }
-            TimeUnit::Millisecond => {
-                instantiate_primitive!(v, nullable, DurationMillisecondType, data_type)
-            }
-            TimeUnit::Microsecond => {
-                instantiate_primitive!(v, nullable, DurationMicrosecondType, data_type)
-            }
-            TimeUnit::Nanosecond => {
-                instantiate_primitive!(v, nullable, DurationNanosecondType, data_type)
-            }
-        },
-        // `IntervalUnit` has exactly three variants, so this match is exhaustive
-        // with no fallback arm (unlike Time32 / Time64).
-        DataType::Interval(u) => match u {
-            IntervalUnit::YearMonth => {
-                instantiate_primitive!(v, nullable, IntervalYearMonthType, data_type)
-            }
-            IntervalUnit::DayTime => {
-                instantiate_primitive!(v, nullable, IntervalDayTimeType, data_type)
-            }
-            IntervalUnit::MonthDayNano => {
-                instantiate_primitive!(v, nullable, IntervalMonthDayNanoType, data_type)
+                instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, TimestampNanosecondType, data_type)
             }
         },
         DataType::Decimal128(_, _) => {
-            instantiate_primitive!(v, nullable, Decimal128Type, data_type)
-        }
-        DataType::Decimal256(_, _) => {
-            instantiate_primitive!(v, nullable, Decimal256Type, data_type)
+            instantiate_primitive!(IS_FIXED_BLOCK_SIZING, block_size, v, nullable, Decimal128Type, data_type)
         }
         DataType::Utf8 => {
-            v.push(Box::new(ByteGroupValueBuilder::<i32>::new(
+            v.push(Box::new(ByteGroupValueBuilder::<IS_FIXED_BLOCK_SIZING, i32>::new(
                 OutputType::Utf8,
+                block_size,
             )));
         }
         DataType::LargeUtf8 => {
-            v.push(Box::new(ByteGroupValueBuilder::<i64>::new(
+            v.push(Box::new(ByteGroupValueBuilder::<IS_FIXED_BLOCK_SIZING, i64>::new(
                 OutputType::Utf8,
+                block_size,
             )));
         }
         DataType::Binary => {
-            v.push(Box::new(ByteGroupValueBuilder::<i32>::new(
+            v.push(Box::new(ByteGroupValueBuilder::<IS_FIXED_BLOCK_SIZING, i32>::new(
                 OutputType::Binary,
+                block_size,
             )));
         }
         DataType::LargeBinary => {
-            v.push(Box::new(ByteGroupValueBuilder::<i64>::new(
+            v.push(Box::new(ByteGroupValueBuilder::<IS_FIXED_BLOCK_SIZING, i64>::new(
                 OutputType::Binary,
+                block_size,
             )));
         }
         // A negative width is not a valid Arrow type; it falls to the `_`
@@ -1117,30 +1097,32 @@ fn make_group_column(field: &Field) -> Result<Box<dyn GroupColumn>> {
         DataType::FixedSizeBinary(byte_width @ 0..) => {
             v.push(Box::new(FixedSizeBinaryGroupValueBuilder::new(byte_width)));
         }
+
         DataType::Utf8View => {
-            v.push(Box::new(ByteViewGroupValueBuilder::<StringViewType>::new()));
+            v.push(Box::new(ByteViewGroupValueBuilder::<IS_FIXED_BLOCK_SIZING, StringViewType>::new(block_size, None)));
         }
         DataType::BinaryView => {
-            v.push(Box::new(ByteViewGroupValueBuilder::<BinaryViewType>::new()));
+            v.push(Box::new(ByteViewGroupValueBuilder::<IS_FIXED_BLOCK_SIZING, BinaryViewType>::new(block_size, None)));
         }
         DataType::Boolean => {
             if nullable {
-                v.push(Box::new(BooleanGroupValueBuilder::<true>::new()));
+                v.push(Box::new(BooleanGroupValueBuilder::<IS_FIXED_BLOCK_SIZING, true>::new(block_size)));
             } else {
-                v.push(Box::new(BooleanGroupValueBuilder::<false>::new()));
+                v.push(Box::new(BooleanGroupValueBuilder::<IS_FIXED_BLOCK_SIZING, false>::new(block_size)));
             }
         }
         DataType::Dictionary(ref key_dt, ref value_dt) => {
             let new_field = Field::new("", *value_dt.clone(), true);
-            let inner = make_group_column(&new_field)?;
+            // value is not fixed block sizing since dictionary values will be reused
+            let inner = make_group_column::<false>(&new_field, 0)?;
             macro_rules! dict_col {
                 ($T:ty) => {
-                    Box::new(dictionary::DictionaryGroupValuesColumn::<$T>::new(
+                    Box::new(dictionary::DictionaryGroupValuesColumn::<IS_FIXED_BLOCK_SIZING, $T>::new(
                         inner, &new_field,
                     ))
                 };
             }
-            let col: Box<dyn GroupColumn> = match key_dt.as_ref() {
+            let col: Box<dyn GroupColumn<IS_FIXED_BLOCK_SIZING>> = match key_dt.as_ref() {
                 DataType::Int8 => dict_col!(Int8Type),
                 DataType::Int16 => dict_col!(Int16Type),
                 DataType::Int32 => dict_col!(Int32Type),
@@ -1162,8 +1144,8 @@ fn make_group_column(field: &Field) -> Result<Box<dyn GroupColumn>> {
         // can be encoded by arrow's row format. This is what lets a mixed
         // schema keep the column-wise fast path for its native columns instead
         // of dropping the whole key onto `GroupValuesRows`.
-        ref dt if dt.is_nested() && RowsGroupColumn::supports_type(dt) => {
-            v.push(Box::new(RowsGroupColumn::try_new(dt.clone())?));
+        dt if dt.is_nested() && RowsGroupColumn::<IS_FIXED_BLOCK_SIZING>::supports_type(dt) => {
+            v.push(Box::new(RowsGroupColumn::<IS_FIXED_BLOCK_SIZING>::try_new(dt.clone(), block_size)?));
         }
         _ => return not_impl_err!("{data_type} not supported in GroupValuesColumn"),
     }

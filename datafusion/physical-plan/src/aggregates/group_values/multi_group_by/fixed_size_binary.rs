@@ -27,6 +27,7 @@ use datafusion_common::utils::proxy::VecAllocExt;
 use datafusion_common::utils::split_vec_min_alloc;
 use datafusion_common::{Result, exec_datafusion_err};
 use std::sync::Arc;
+use datafusion_functions_aggregate_common::blocked_helpers::{BlockedBytesBufferBuilder, BlockedNullsBuilder};
 
 /// An implementation of [`GroupColumn`] for `FixedSizeBinary` values
 ///
@@ -39,39 +40,39 @@ use std::sync::Arc;
 ///
 /// Null values occupy `byte_width` zeroed bytes in the buffer so that the
 /// value of row `i` is always stored at `i * byte_width..(i + 1) * byte_width`.
-pub struct FixedSizeBinaryGroupValueBuilder {
+pub struct FixedSizeBinaryGroupValueBuilder<const FIXED_SIZE_BLOCK: bool> {
     /// The width in bytes of each value, from `DataType::FixedSizeBinary`
     byte_width: usize,
     /// The flattened group values, `byte_width` bytes per value
-    buffer: Vec<u8>,
+    buffer: BlockedBytesBufferBuilder,
     /// The number of group values stored
     ///
     /// Tracked explicitly rather than derived from `buffer.len()` because
     /// `byte_width` may be `0`
     len: usize,
     /// Null state (null rows still occupy `byte_width` bytes in `buffer`)
-    nulls: MaybeNullBufferBuilder,
+    nulls: BlockedNullsBuilder<FIXED_SIZE_BLOCK>,
 }
 
-impl FixedSizeBinaryGroupValueBuilder {
+impl<const FIXED_SIZE_BLOCK: bool> FixedSizeBinaryGroupValueBuilder<FIXED_SIZE_BLOCK> {
     /// Create a new builder for values of `byte_width` bytes each
     ///
     /// `byte_width` is the width carried by `DataType::FixedSizeBinary` and
     /// must be non-negative (negative widths are rejected by the dispatch in
     /// `make_group_column`)
-    pub fn new(byte_width: i32) -> Self {
+    pub fn new(byte_width: i32, block_size: usize) -> Self {
         debug_assert!(byte_width >= 0);
         Self {
             byte_width: byte_width as usize,
-            buffer: Vec::new(),
+            buffer: BlockedBytesBufferBuilder::new(),
             len: 0,
-            nulls: MaybeNullBufferBuilder::new(),
+            nulls: BlockedNullsBuilder::new(block_size),
         }
     }
 
     fn do_append_val_inner(&mut self, array: &FixedSizeBinaryArray, row: usize) {
         if array.is_null(row) {
-            self.nulls.append(true);
+            self.nulls.push_null(true);
             // Null rows still occupy `byte_width` (zeroed) bytes in the
             // buffer so the value offset stays a function of the row index
             self.buffer.resize(self.buffer.len() + self.byte_width, 0);

@@ -30,7 +30,8 @@ use hashbrown::hash_table::HashTable;
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::sync::Arc;
-
+use datafusion_expr_common::groups_accumulator::BlocksIndex;
+use datafusion_functions_aggregate_common::blocked_helpers::{BlockedRawHashTableBuilder, BlockedVecBuilder};
 use crate::aggregates::AGGREGATION_HASH_SEED;
 
 /// [`GroupColumn`] for dictionary-encoded columns with key type `K`.
@@ -38,18 +39,19 @@ use crate::aggregates::AGGREGATION_HASH_SEED;
 /// `inner` holds one slot per distinct value seen across all batches.
 /// `group_to_inner[group_idx]` maps each group to its slot in `inner`,
 /// so groups with the same value share a slot rather than duplicating data.
-pub struct DictionaryGroupValuesColumn<K: ArrowDictionaryKeyType + Send + Sync> {
+pub struct DictionaryGroupValuesColumn<const FIXED_BLOCK_SIZING: bool, K: ArrowDictionaryKeyType + Send + Sync> {
     /// Deduplicated store of distinct values.
-    inner: Box<dyn GroupColumn>,
+    inner: Box<dyn GroupColumn<false>>,
     /// Unary null array (length 1) reused for every null appended to `inner`.
     null_array: ArrayRef,
     /// Maps each group index to its slot in `inner`.
-    group_to_inner: Vec<usize>,
+    group_to_inner: BlockedVecBuilder<FIXED_BLOCK_SIZING, usize>,
     /// Lookup table mapping `(value_hash, inner_slot)` for each non-null distinct value.
-    value_dedup: HashTable<(u64, usize)>,
+    value_dedup: BlockedRawHashTableBuilder<FIXED_BLOCK_SIZING, (u64, usize)>,
     /// Tracked allocation size of `value_dedup` for memory accounting via `size()`.
     value_dedup_size: usize,
     /// Slot in `inner` for the null group; `None` until the first null is seen.
+    /// TODO - this should be for every block, since once the block finished the position is missing
     null_inner_slot: Option<usize>,
     /// Hash seed — must match `create_hashes` so hashes are consistent across calls.
     random_state: RandomState,
@@ -60,14 +62,17 @@ pub struct DictionaryGroupValuesColumn<K: ArrowDictionaryKeyType + Send + Sync> 
     _phantom: PhantomData<K>,
 }
 
-impl<K: ArrowDictionaryKeyType + Send + Sync> DictionaryGroupValuesColumn<K> {
-    pub fn new(inner: Box<dyn GroupColumn>, field: &Field) -> Self {
+impl<const FIXED_BLOCK_SIZING: bool, K: ArrowDictionaryKeyType + Send + Sync> DictionaryGroupValuesColumn<FIXED_BLOCK_SIZING, K> {
+    pub fn new(inner: Box<dyn GroupColumn<false>>, field: &Field, block_size: usize) -> Self {
+        if FIXED_BLOCK_SIZING {
+            assert_ne!(block_size, 0);
+        }
         let null_array = arrow::array::new_null_array(field.data_type(), 1);
         Self {
             inner,
             null_array,
-            group_to_inner: Vec::new(),
-            value_dedup: HashTable::new(),
+            group_to_inner: BlockedVecBuilder::new(block_size),
+            value_dedup: BlockedRawHashTableBuilder::new(block_size),
             value_dedup_size: 0,
             null_inner_slot: None,
             random_state: AGGREGATION_HASH_SEED,
@@ -244,7 +249,7 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> DictionaryGroupValuesColumn<K> {
     #[inline(never)]
     fn equal_to_per_row(
         &self,
-        lhs_rows: &[usize],
+        lhs_rows: &[BlocksIndex],
         dict_values: &ArrayRef,
         dict: &DictionaryArray<K>,
         rhs_rows: &[usize],
@@ -272,11 +277,14 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> DictionaryGroupValuesColumn<K> {
     }
 }
 
-impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
-    for DictionaryGroupValuesColumn<K>
+impl<const IS_FIXED_BLOCK_SIZING: bool, K: ArrowDictionaryKeyType + Send + Sync> GroupColumn<IS_FIXED_BLOCK_SIZING>
+    for DictionaryGroupValuesColumn<IS_FIXED_BLOCK_SIZING, K>
 {
-    fn equal_to(&self, lhs_row: usize, array: &ArrayRef, rhs_row: usize) -> bool {
+    fn equal_to(&self, lhs_row: BlocksIndex, array: &ArrayRef, rhs_row: usize) -> bool {
+        // get the index in the block
         let lhs_slot = self.group_to_inner[lhs_row];
+        // get the
+        let lhs_slot = BlocksIndex::new(lhs_row.block_index(), lhs_slot);
         let dict = array.as_dictionary::<K>();
         match dict.key(rhs_row) {
             None => self.inner.equal_to(lhs_slot, &self.null_array, 0),
@@ -307,7 +315,7 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
 
     fn vectorized_equal_to(
         &self,
-        lhs_rows: &[usize],
+        lhs_rows: &[BlocksIndex],
         array: &ArrayRef,
         rhs_rows: &[usize],
         equal_to_results: &mut BooleanBufferBuilder,
@@ -450,13 +458,13 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
             + self.null_array.get_array_memory_size()
             + size_of::<Self>()
     }
-
-    fn build(self: Box<Self>) -> ArrayRef {
-        let null_inner_slot = self.null_inner_slot;
-        let values = self.inner.build();
-        Self::into_dict(values, &self.group_to_inner, null_inner_slot)
-    }
-
+    //
+    // fn build(self: Box<Self>) -> ArrayRef {
+    //     let null_inner_slot = self.null_inner_slot;
+    //     let values = self.inner.build();
+    //     Self::into_dict(values, &self.group_to_inner, null_inner_slot)
+    // }
+    //
     fn take_n(&mut self, n: usize) -> ArrayRef {
         let old_inner_len = self.inner.len();
         let all_inner_values = self.inner.take_n(old_inner_len);
@@ -543,6 +551,20 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
         self.check_key_overflow().expect("key overflow in take_n");
 
         emitted
+    }
+
+    fn take_block(&mut self) -> Option<ArrayRef> {
+        let null_inner_slot = self.null_inner_slot;
+        let values = self.inner.take_block();
+        let group_to_inner = self.group_to_inner.take_block();
+        Self::into_dict(values, &group_to_inner, null_inner_slot)
+        todo!()
+    }
+
+    fn start_new_block(&mut self) {
+        self.inner.start_new_block();
+        self.group_to_inner.start_new_block();
+        todo!()
     }
 }
 
