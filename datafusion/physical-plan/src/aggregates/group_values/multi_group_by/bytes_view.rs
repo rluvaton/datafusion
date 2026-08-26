@@ -15,26 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::VecDeque;
-use crate::execution::aggregates::group_values::multi_group_by::{
+use crate::aggregates::group_values::multi_group_by::{
     GroupColumn, Nulls, nulls_equal_to,
 };
-use crate::execution::aggregates::group_values::null_builder::MaybeNullBufferBuilder;
+use crate::aggregates::group_values::null_builder::NullBufferBuilderExt;
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanBufferBuilder, ByteView, GenericByteViewArray,
-    make_view,
+    NullBufferBuilder,
 };
 use arrow::buffer::{Buffer, ScalarBuffer};
 use arrow::datatypes::ByteViewType;
-use datafusion::common::Result;
-use datafusion::common::utils::split_vec_min_alloc;
+use datafusion_common::Result;
+use datafusion_common::utils::split_vec_min_alloc;
 use std::marker::PhantomData;
 use std::mem::{replace, size_of};
 use std::sync::Arc;
-use crate::execution::aggregates::group_values::blocked_primitives::BlockedBytesBufferBuilder;
-use crate::execution::aggregates::group_values::blocked_primitives::BlockedNullsBuilder;
-use crate::execution::aggregates::group_values::blocked_primitives::BlockedVecBuilder;
-use crate::execution::aggregates::group_values::blocked_primitives::BlockedIndex;
 
 const BYTE_VIEW_MAX_BLOCK_SIZE: usize = 2 * 1024 * 1024;
 
@@ -46,7 +41,7 @@ const BYTE_VIEW_MAX_BLOCK_SIZE: usize = 2 * 1024 * 1024;
 /// 1. Efficient comparison of incoming rows to existing rows
 /// 2. Efficient construction of the final output array
 /// 3. Efficient to perform `take_n` comparing to use `GenericByteViewBuilder`
-pub struct ByteViewGroupValueBuilder<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> {
+pub struct ByteViewGroupValueBuilder<B: ByteViewType> {
     /// The views of string values
     ///
     /// If string len <= 12, the view's format will be:
@@ -54,17 +49,16 @@ pub struct ByteViewGroupValueBuilder<const FIXED_BLOCK_SIZING: bool, B: ByteView
     ///
     /// If string len > 12, its format will be:
     ///     offset(4B) | buffer_index(4B) | prefix(4B) | len(4B)
-    views: BlockedVecBuilder<FIXED_BLOCK_SIZING, u128>,
+    views: Vec<u128>,
 
     /// The progressing block
     ///
     /// New values will be inserted into it until its capacity
     /// is not enough(detail can see `max_block_size`).
-    /// this is why it is marked as managed blocks
-    data_blocks: BlockedBytesBufferBuilder,
+    in_progress: Vec<u8>,
 
-    /// For each block, how many blocks are there
-    view_blocks_per_block: VecDeque<usize>,
+    /// The completed blocks
+    completed: Vec<Buffer>,
 
     /// The max size of `in_progress`
     ///
@@ -76,25 +70,26 @@ pub struct ByteViewGroupValueBuilder<const FIXED_BLOCK_SIZING: bool, B: ByteView
     max_block_size: usize,
 
     /// Nulls
-    nulls: BlockedNullsBuilder<FIXED_BLOCK_SIZING>,
+    nulls: NullBufferBuilder,
 
     /// phantom data so the type requires `<B>`
     _phantom: PhantomData<B>,
 }
 
+impl<B: ByteViewType> Default for ByteViewGroupValueBuilder<B> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-impl<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> ByteViewGroupValueBuilder<FIXED_BLOCK_SIZING, B> {
-    pub fn new(block_size: usize, max_buffer_block_size: Option<usize>) -> Self {
-        if FIXED_BLOCK_SIZING {
-            assert_ne!(block_size, 0);
-        }
-
+impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
+    pub fn new() -> Self {
         Self {
-            views: BlockedVecBuilder::new(block_size),
-            data_blocks: BlockedBytesBufferBuilder::new(),
-            view_blocks_per_block: VecDeque::from(vec![1]),
-            max_block_size: max_buffer_block_size.unwrap_or(BYTE_VIEW_MAX_BLOCK_SIZE),
-            nulls: BlockedNullsBuilder::new(block_size),
+            views: Vec::new(),
+            in_progress: Vec::new(),
+            completed: Vec::new(),
+            max_block_size: BYTE_VIEW_MAX_BLOCK_SIZE,
+            nulls: NullBufferBuilder::empty(),
             _phantom: PhantomData {},
         }
     }
@@ -105,7 +100,7 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> ByteViewGroupValueBuilder<
         self
     }
 
-    fn equal_to_inner(&self, lhs_row: BlockedIndex, array: &ArrayRef, rhs_row: usize) -> bool {
+    fn equal_to_inner(&self, lhs_row: usize, array: &ArrayRef, rhs_row: usize) -> bool {
         let array = array.as_byte_view::<B>();
         // since this is a single row comparison, don't bother specializing for nulls/buffers
         self.do_equal_to_inner::<true, true>(lhs_row, array, rhs_row)
@@ -116,13 +111,13 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> ByteViewGroupValueBuilder<
 
         // Null row case, set and return
         if arr.is_null(row) {
-            self.nulls.push_null();
+            self.nulls.append_null();
             self.views.push(0);
             return;
         }
 
         // Not null row case
-        self.nulls.push_non_null();
+        self.nulls.append_non_null();
         self.do_append_val_inner(arr, row);
     }
 
@@ -131,7 +126,7 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> ByteViewGroupValueBuilder<
     #[inline(never)]
     fn vectorized_equal_to_inner<const HAS_NULLS: bool, const HAS_BUFFERS: bool>(
         &self,
-        lhs_rows: &[BlockedIndex],
+        lhs_rows: &[usize],
         array: &GenericByteViewArray<B>,
         rhs_rows: &[usize],
         equal_to_results: &mut BooleanBufferBuilder,
@@ -150,7 +145,11 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> ByteViewGroupValueBuilder<
         }
     }
 
-    fn vectorized_append_inner(&mut self, array: &ArrayRef, rows: &[usize]) {
+    fn vectorized_append_inner(
+        &mut self,
+        array: &ArrayRef,
+        rows: &[usize],
+    ) -> Result<()> {
         let arr = array.as_byte_view::<B>();
         let null_count = array.null_count();
         let num_rows = array.len();
@@ -170,56 +169,82 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> ByteViewGroupValueBuilder<
             }
 
             Nulls::None => {
-                self.nulls.push_n_non_nulls(rows.len());
-                for &row in rows {
-                    self.do_append_val_inner(arr, row);
+                self.nulls.append_n_non_nulls(rows.len());
+                if arr.data_buffers().is_empty() {
+                    // Fast path: all strings are inline (≤12 bytes).
+                    // The input array's u128 views are already in the correct format;
+                    // copy them directly instead of going through value() → make_view().
+                    self.views.extend(rows.iter().map(|&row| arr.views()[row]));
+                } else {
+                    // Slow path: some strings may be non-inline (>12 bytes).
+                    // Pre-reserve and delegate to do_append_val_inner which
+                    // reads raw views directly and reuses source prefixes.
+                    self.views.try_reserve(rows.len()).map_err(|e| {
+                        datafusion_common::exec_datafusion_err!(
+                            "failed to reserve {0} views: {e}",
+                            rows.len()
+                        )
+                    })?;
+                    for &row in rows {
+                        self.do_append_val_inner(arr, row);
+                    }
                 }
             }
 
             Nulls::All => {
-                self.nulls.push_n_nulls(rows.len());
-                self.views.push_value_n(0, rows.len());
+                self.nulls.append_n_nulls(rows.len());
+                let new_len = self.views.len() + rows.len();
+                self.views.resize(new_len, 0);
             }
         }
+        Ok(())
     }
 
     fn do_append_val_inner(&mut self, array: &GenericByteViewArray<B>, row: usize)
     where
         B: ByteViewType,
     {
-        let value: &[u8] = array.value(row).as_ref();
+        // SAFETY: the caller ensures `row` is valid
+        let view = unsafe { *array.views().get_unchecked(row) };
+        let len = view as u32;
 
-        let value_len = value.len();
-        let view = if value_len <= 12 {
-            make_view(value, 0, 0)
+        if len <= 12 {
+            // Inline value: the view is already self-contained, push as-is.
+            self.views.push(view);
         } else {
-            // Ensure big enough block to hold the value firstly
-            self.ensure_in_progress_big_enough(value_len);
-
-            // Append value
-
-            // Make buffer index relative to the start of the current block
-            let buffer_index = self.view_blocks_per_block.back().unwrap() - 1;
-            let offset = self.data_blocks.current_block_len().expect("must have current block");
-            self.data_blocks.extend_from_slice(value);
-
-            make_view(value, buffer_index as u32, offset as u32)
-        };
-
-        // Append view
-        self.views.push(view);
+            // Non-inline value: copy the buffer data and construct a new view
+            // that points into our own buffers, reusing the source prefix.
+            let src = ByteView::from(view);
+            self.ensure_in_progress_big_enough(len as usize);
+            let new_buffer_index = self.completed.len() as u32;
+            let new_offset = self.in_progress.len() as u32;
+            let src_buf = &array.data_buffers()[src.buffer_index as usize];
+            self.in_progress.extend_from_slice(
+                &src_buf[src.offset as usize..(src.offset + src.length) as usize],
+            );
+            let new_view = ByteView {
+                length: src.length,
+                prefix: src.prefix,
+                buffer_index: new_buffer_index,
+                offset: new_offset,
+            }
+            .as_u128();
+            self.views.push(new_view);
+        }
     }
 
     fn ensure_in_progress_big_enough(&mut self, value_len: usize) {
         debug_assert!(value_len > 12);
-        let require_cap = self.data_blocks.current_block_len().expect("must have current block") + value_len;
+        let require_cap = self.in_progress.len() + value_len;
 
         // If current block isn't big enough, flush it and create a new in progress block
         if require_cap > self.max_block_size {
-            self.data_blocks.start_new_block();
-            // Increase number of blocks
-            *self.view_blocks_per_block.back_mut().unwrap() += 1;
-
+            let flushed_block = replace(
+                &mut self.in_progress,
+                Vec::with_capacity(self.max_block_size),
+            );
+            let buffer = Buffer::from_vec(flushed_block);
+            self.completed.push(buffer);
         }
     }
 
@@ -231,7 +256,7 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> ByteViewGroupValueBuilder<
     #[inline(always)]
     fn do_equal_to_inner<const HAS_NULLS: bool, const HAS_BUFFERS: bool>(
         &self,
-        lhs_row: BlockedIndex,
+        lhs_row: usize,
         array: &GenericByteViewArray<B>,
         rhs_row: usize,
     ) -> bool {
@@ -246,8 +271,8 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> ByteViewGroupValueBuilder<
 
         // Otherwise, we need to check their values
 
-        // TODO - add back the get unchecked
-        let exist_view = self.views[lhs_row];
+        // SAFETY: the `lhs_row` and rhs_row` are valid
+        let exist_view = unsafe { *self.views.get_unchecked(lhs_row) };
         let exist_view_len = exist_view as u32;
 
         let input_view = unsafe { *array.views().get_unchecked(rhs_row) };
@@ -287,25 +312,223 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> ByteViewGroupValueBuilder<
                 let buffer_index = byte_view.buffer_index as usize;
                 let offset = byte_view.offset as usize;
                 let length = byte_view.length as usize;
-                let current_block_num_data_blocks = *self.view_blocks_per_block.back().unwrap() - 1;
-                debug_assert!(buffer_index <= current_block_num_data_blocks);
-
-                let actual_buffer_index = self.data_blocks.num_blocks() - current_block_num_data_blocks + buffer_index;
-
-                let block = self.data_blocks.block(actual_buffer_index);
+                debug_assert!(buffer_index <= self.completed.len());
 
                 unsafe {
-                    block.as_slice().get_unchecked(offset..offset + length)
+                    if buffer_index < self.completed.len() {
+                        let block = self.completed.get_unchecked(buffer_index);
+                        block.as_slice().get_unchecked(offset..offset + length)
+                    } else {
+                        self.in_progress.get_unchecked(offset..offset + length)
+                    }
                 }
             };
             let input_full: &[u8] = unsafe { array.value_unchecked(rhs_row).as_ref() };
             exist_full == input_full
         }
     }
+
+    fn build_inner(self) -> ArrayRef {
+        let Self {
+            views,
+            in_progress,
+            mut completed,
+            nulls,
+            ..
+        } = self;
+
+        // Build nulls
+        let null_buffer = nulls.build();
+
+        // Build values
+        // Flush `in_process` firstly
+        if !in_progress.is_empty() {
+            let buffer = Buffer::from(in_progress);
+            completed.push(buffer);
+        }
+
+        let views = ScalarBuffer::from(views);
+
+        // Safety:
+        // * all views were correctly made
+        // * (if utf8): Input was valid Utf8 so buffer contents are
+        // valid utf8 as well
+        unsafe {
+            Arc::new(GenericByteViewArray::<B>::new_unchecked(
+                views,
+                completed,
+                null_buffer,
+            ))
+        }
+    }
+
+    fn take_n_inner(&mut self, n: usize) -> ArrayRef {
+        debug_assert!(self.len() >= n);
+
+        // The `n == len` case, we need to take all
+        if self.len() == n {
+            let new_builder = Self::new().with_max_block_size(self.max_block_size);
+            let cur_builder = replace(self, new_builder);
+            return cur_builder.build_inner();
+        }
+
+        // The `n < len` case
+        // Take n for nulls
+        let null_buffer = self.nulls.take_n(n);
+
+        // Take n for values:
+        //   - Take first n `view`s from `views`
+        //
+        //   - Find the last non-inlined `view`, if all inlined,
+        //     we can build array and return happily, otherwise we
+        //     we need to continue to process related buffers
+        //
+        //   - Get the last related `buffer index`(let's name it `buffer index n`)
+        //     from last non-inlined `view`
+        //
+        //   - Take buffers, the key is that we need to know if we need to take
+        //     the whole last related buffer. The logic is a bit complex, you can
+        //     detail in `take_buffers_with_whole_last`, `take_buffers_with_partial_last`
+        //     and other related steps in following
+        //
+        //   - Shift the `buffer index` of remaining non-inlined `views`
+        //
+        let first_n_views = split_vec_min_alloc(&mut self.views, n);
+
+        let last_non_inlined_view = first_n_views
+            .iter()
+            .rev()
+            .find(|view| ((**view) as u32) > 12);
+
+        // All taken views inlined
+        let Some(view) = last_non_inlined_view else {
+            let views = ScalarBuffer::from(first_n_views);
+
+            // Safety:
+            // * all views were correctly made
+            // * (if utf8): Input was valid Utf8 so buffer contents are
+            // valid utf8 as well
+            unsafe {
+                return Arc::new(GenericByteViewArray::<B>::new_unchecked(
+                    views,
+                    Vec::new(),
+                    null_buffer,
+                ));
+            }
+        };
+
+        // Unfortunately, some taken views non-inlined
+        let view = ByteView::from(*view);
+        let last_remaining_buffer_index = view.buffer_index as usize;
+
+        // Check should we take the whole `last_remaining_buffer_index` buffer
+        let take_whole_last_buffer = self.should_take_whole_buffer(
+            last_remaining_buffer_index,
+            (view.offset + view.length) as usize,
+        );
+
+        // Take related buffers
+        let buffers = if take_whole_last_buffer {
+            self.take_buffers_with_whole_last(last_remaining_buffer_index)
+        } else {
+            self.take_buffers_with_partial_last(
+                last_remaining_buffer_index,
+                (view.offset + view.length) as usize,
+            )
+        };
+
+        // Shift `buffer index`s finally
+        let shifts = if take_whole_last_buffer {
+            last_remaining_buffer_index + 1
+        } else {
+            last_remaining_buffer_index
+        };
+
+        self.views.iter_mut().for_each(|view| {
+            if (*view as u32) > 12 {
+                let mut byte_view = ByteView::from(*view);
+                byte_view.buffer_index -= shifts as u32;
+                *view = byte_view.as_u128();
+            }
+        });
+
+        // Build array and return
+        let views = ScalarBuffer::from(first_n_views);
+
+        // Safety:
+        // * all views were correctly made
+        // * (if utf8): Input was valid Utf8 so buffer contents are
+        // valid utf8 as well
+        unsafe {
+            Arc::new(GenericByteViewArray::<B>::new_unchecked(
+                views,
+                buffers,
+                null_buffer,
+            ))
+        }
+    }
+
+    fn take_buffers_with_whole_last(
+        &mut self,
+        last_remaining_buffer_index: usize,
+    ) -> Vec<Buffer> {
+        if last_remaining_buffer_index == self.completed.len() {
+            self.flush_in_progress();
+        }
+        self.completed
+            .drain(0..=last_remaining_buffer_index)
+            .collect()
+    }
+
+    fn take_buffers_with_partial_last(
+        &mut self,
+        last_remaining_buffer_index: usize,
+        last_take_len: usize,
+    ) -> Vec<Buffer> {
+        let mut take_buffers = Vec::with_capacity(last_remaining_buffer_index + 1);
+        debug_assert!(last_remaining_buffer_index <= self.completed.len());
+
+        // Process the `last_remaining_buffer_index` buffer before draining so the index is valid.
+        let last_buffer = if last_remaining_buffer_index < self.completed.len() {
+            // If it is in `completed`, simply clone
+            self.completed[last_remaining_buffer_index].clone()
+        } else {
+            // If it is `in_progress`, copied `0 ~ offset` part
+            debug_assert!(last_take_len <= self.in_progress.len());
+            let taken_last_buffer = self.in_progress[0..last_take_len].to_vec();
+            Buffer::from_vec(taken_last_buffer)
+        };
+
+        // Take `0 ~ last_remaining_buffer_index - 1` buffers
+        if last_remaining_buffer_index > 0 {
+            take_buffers.extend(self.completed.drain(0..last_remaining_buffer_index));
+        }
+        take_buffers.push(last_buffer);
+
+        take_buffers
+    }
+
+    #[inline]
+    fn should_take_whole_buffer(&self, buffer_index: usize, take_len: usize) -> bool {
+        if buffer_index < self.completed.len() {
+            take_len == self.completed[buffer_index].len()
+        } else {
+            take_len == self.in_progress.len()
+        }
+    }
+
+    fn flush_in_progress(&mut self) {
+        let flushed_block = replace(
+            &mut self.in_progress,
+            Vec::with_capacity(self.max_block_size),
+        );
+        let buffer = Buffer::from_vec(flushed_block);
+        self.completed.push(buffer);
+    }
 }
 
-impl<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> GroupColumn<FIXED_BLOCK_SIZING> for ByteViewGroupValueBuilder<FIXED_BLOCK_SIZING, B> {
-    fn equal_to(&self, lhs_row: BlockedIndex, array: &ArrayRef, rhs_row: usize) -> bool {
+impl<B: ByteViewType> GroupColumn for ByteViewGroupValueBuilder<B> {
+    fn equal_to(&self, lhs_row: usize, array: &ArrayRef, rhs_row: usize) -> bool {
         self.equal_to_inner(lhs_row, array, rhs_row)
     }
 
@@ -316,7 +539,7 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> GroupColumn<FIXED_BLOCK_SI
 
     fn vectorized_equal_to(
         &self,
-        group_indices: &[BlockedIndex],
+        group_indices: &[usize],
         array: &ArrayRef,
         rows: &[usize],
         equal_to_results: &mut BooleanBufferBuilder,
@@ -354,8 +577,7 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> GroupColumn<FIXED_BLOCK_SI
     }
 
     fn vectorized_append(&mut self, array: &ArrayRef, rows: &[usize]) -> Result<()> {
-        self.vectorized_append_inner(array, rows);
-        Ok(())
+        self.vectorized_append_inner(array, rows)
     }
 
     fn len(&self) -> usize {
@@ -363,97 +585,25 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> GroupColumn<FIXED_BLOCK_SI
     }
 
     fn size(&self) -> usize {
+        let buffers_size = self
+            .completed
+            .iter()
+            .map(|buf| buf.capacity() * size_of::<u8>())
+            .sum::<usize>();
+
         self.nulls.allocated_size()
-            + self.views.allocated_size()
-            + self.data_blocks.allocated_size()
+            + self.views.capacity() * size_of::<u128>()
+            + self.in_progress.capacity() * size_of::<u8>()
+            + buffers_size
             + size_of::<Self>()
     }
 
-    fn take_block(&mut self) -> Option<ArrayRef> {
-        let views = self.views.take_block_finished();
-
-        let null_buffer = self.nulls.take_block();
-
-        assert!(self.view_blocks_per_block.len() >= 1, "must have only 1 views per block since no blocks");
-
-        let (views, null_buffer) = match (views, null_buffer) {
-            (Some(views), Some(null_buffer)) => (views, null_buffer),
-            (None, None) => {
-                assert_eq!(self.view_blocks_per_block.back(), Some(&1_usize), "must have only 1 block");
-                assert_eq!(self.data_blocks.current_block_len(), Some(0), "Must have empty block");
-                return None;
-            },
-            (Some(_), None) => unreachable!("must have null buffer if views are present"),
-            (None, Some(_)) => unreachable!("must have views if null buffer is present"),
-        };
-
-        let current_block_count = {
-            let number_of_views_per_block = self.view_blocks_per_block.back_mut().unwrap();
-
-            std::mem::replace(number_of_views_per_block, 1)
-        };
-
-        let buffers = (0..current_block_count).map(|_| self.data_blocks.take_block_finished().expect("must have the block")).collect::<Vec<_>>();
-
-
-        // Take n for values:
-        //   - Take first n `view`s from `views`
-        //
-        //   - Find the last non-inlined `view`, if all inlined,
-        //     we can build array and return happily, otherwise we
-        //     we need to continue to process related buffers
-        //
-        //   - Get the last related `buffer index`(let's name it `buffer index n`)
-        //     from last non-inlined `view`
-        //
-        //   - Take buffers, the key is that we need to know if we need to take
-        //     the whole last related buffer. The logic is a bit complex, you can
-        //     detail in `take_buffers_with_whole_last`, `take_buffers_with_partial_last`
-        //     and other related steps in following
-        //
-        //   - Shift the `buffer index` of remaining non-inlined `views`
-        //
-
-        let last_non_inlined_view = views
-          .iter()
-          .rev()
-          .find(|view| ((**view) as u32) > 12);
-
-        // All taken views inlined
-        if last_non_inlined_view.is_none() {
-
-            // Safety:
-            // * all views were correctly made
-            // * (if utf8): Input was valid Utf8 so buffer contents are
-            // valid utf8 as well
-            unsafe {
-                return Some(Arc::new(GenericByteViewArray::<B>::new_unchecked(
-                    views,
-                    Vec::new(),
-                    null_buffer,
-                )));
-            }
-        };
-
-        // Safety:
-        // * all views were correctly made
-        // * (if utf8): Input was valid Utf8 so buffer contents are
-        // valid utf8 as well
-        Some(unsafe {
-            Arc::new(GenericByteViewArray::<B>::new_unchecked(
-                views,
-                buffers,
-                null_buffer,
-            ))
-        })
+    fn build(self: Box<Self>) -> ArrayRef {
+        Self::build_inner(*self)
     }
 
-    fn start_new_block(&mut self) {
-        // TODO - should it be 0 or 1
-        self.view_blocks_per_block.push_back(1);
-        self.data_blocks.start_new_block();
-        self.views.start_new_block();
-        self.nulls.start_new_block();
+    fn take_n(&mut self, n: usize) -> ArrayRef {
+        self.take_n_inner(n)
     }
 }
 
@@ -461,7 +611,7 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteViewType> GroupColumn<FIXED_BLOCK_SI
 mod tests {
     use std::sync::Arc;
 
-    use crate::execution::aggregates::group_values::multi_group_by::bytes_view::ByteViewGroupValueBuilder;
+    use crate::aggregates::group_values::multi_group_by::bytes_view::ByteViewGroupValueBuilder;
     use arrow::array::{
         ArrayRef, AsArray, BooleanBufferBuilder, NullBufferBuilder, StringViewArray,
     };

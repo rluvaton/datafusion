@@ -18,16 +18,16 @@
 use crate::aggregates::group_values::multi_group_by::{
     GroupColumn, Nulls, nulls_equal_to,
 };
-use crate::aggregates::group_values::null_builder::MaybeNullBufferBuilder;
+use crate::aggregates::group_values::null_builder::NullBufferBuilderExt;
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanBufferBuilder, FixedSizeBinaryArray,
+    NullBufferBuilder,
 };
 use arrow::buffer::{Buffer, NullBuffer};
 use datafusion_common::utils::proxy::VecAllocExt;
 use datafusion_common::utils::split_vec_min_alloc;
 use datafusion_common::{Result, exec_datafusion_err};
 use std::sync::Arc;
-use datafusion_functions_aggregate_common::blocked_helpers::{BlockedBytesBufferBuilder, BlockedNullsBuilder};
 
 /// An implementation of [`GroupColumn`] for `FixedSizeBinary` values
 ///
@@ -40,44 +40,44 @@ use datafusion_functions_aggregate_common::blocked_helpers::{BlockedBytesBufferB
 ///
 /// Null values occupy `byte_width` zeroed bytes in the buffer so that the
 /// value of row `i` is always stored at `i * byte_width..(i + 1) * byte_width`.
-pub struct FixedSizeBinaryGroupValueBuilder<const FIXED_SIZE_BLOCK: bool> {
+pub struct FixedSizeBinaryGroupValueBuilder {
     /// The width in bytes of each value, from `DataType::FixedSizeBinary`
     byte_width: usize,
     /// The flattened group values, `byte_width` bytes per value
-    buffer: BlockedBytesBufferBuilder,
+    buffer: Vec<u8>,
     /// The number of group values stored
     ///
     /// Tracked explicitly rather than derived from `buffer.len()` because
     /// `byte_width` may be `0`
     len: usize,
     /// Null state (null rows still occupy `byte_width` bytes in `buffer`)
-    nulls: BlockedNullsBuilder<FIXED_SIZE_BLOCK>,
+    nulls: NullBufferBuilder,
 }
 
-impl<const FIXED_SIZE_BLOCK: bool> FixedSizeBinaryGroupValueBuilder<FIXED_SIZE_BLOCK> {
+impl FixedSizeBinaryGroupValueBuilder {
     /// Create a new builder for values of `byte_width` bytes each
     ///
     /// `byte_width` is the width carried by `DataType::FixedSizeBinary` and
     /// must be non-negative (negative widths are rejected by the dispatch in
     /// `make_group_column`)
-    pub fn new(byte_width: i32, block_size: usize) -> Self {
+    pub fn new(byte_width: i32) -> Self {
         debug_assert!(byte_width >= 0);
         Self {
             byte_width: byte_width as usize,
-            buffer: BlockedBytesBufferBuilder::new(),
+            buffer: Vec::new(),
             len: 0,
-            nulls: BlockedNullsBuilder::new(block_size),
+            nulls: NullBufferBuilder::empty(),
         }
     }
 
     fn do_append_val_inner(&mut self, array: &FixedSizeBinaryArray, row: usize) {
         if array.is_null(row) {
-            self.nulls.push_null(true);
+            self.nulls.append_null();
             // Null rows still occupy `byte_width` (zeroed) bytes in the
             // buffer so the value offset stays a function of the row index
             self.buffer.resize(self.buffer.len() + self.byte_width, 0);
         } else {
-            self.nulls.append(false);
+            self.nulls.append_non_null();
             self.buffer.extend_from_slice(array.value(row));
         }
         self.len += 1;
@@ -188,7 +188,7 @@ impl GroupColumn for FixedSizeBinaryGroupValueBuilder {
             }
 
             Nulls::None => {
-                self.nulls.append_n(rows.len(), false);
+                self.nulls.append_n_non_nulls(rows.len());
                 for &row in rows {
                     self.buffer.extend_from_slice(arr.value(row));
                 }
@@ -196,7 +196,7 @@ impl GroupColumn for FixedSizeBinaryGroupValueBuilder {
             }
 
             Nulls::All => {
-                self.nulls.append_n(rows.len(), true);
+                self.nulls.append_n_nulls(rows.len());
                 self.buffer
                     .resize(self.buffer.len() + rows.len() * self.byte_width, 0);
                 self.len += rows.len();

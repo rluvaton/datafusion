@@ -17,14 +17,13 @@
 
 use std::sync::Arc;
 
-use crate::execution::aggregates::group_values::multi_group_by::Nulls;
-use crate::execution::aggregates::group_values::multi_group_by::{GroupColumn, nulls_equal_to};
-use crate::execution::aggregates::group_values::null_builder::MaybeNullBufferBuilder;
-use arrow::array::{Array as _, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder};
-use datafusion::common::Result;
-use crate::execution::aggregates::group_values::blocked_primitives::BlockedBooleanBuilder;
-use crate::execution::aggregates::group_values::blocked_primitives::BlockedNullsBuilder;
-use crate::execution::aggregates::group_values::blocked_primitives::BlockedIndex;
+use crate::aggregates::group_values::multi_group_by::Nulls;
+use crate::aggregates::group_values::multi_group_by::{GroupColumn, nulls_equal_to};
+use crate::aggregates::group_values::null_builder::NullBufferBuilderExt;
+use arrow::array::{
+    Array as _, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder, NullBufferBuilder,
+};
+use datafusion_common::Result;
 
 /// An implementation of [`GroupColumn`] for booleans
 ///
@@ -34,28 +33,23 @@ use crate::execution::aggregates::group_values::blocked_primitives::BlockedIndex
 ///
 /// `NULLABLE`: if the data can contain any nulls
 #[derive(Debug)]
-pub struct BooleanGroupValueBuilder<const FIXED_BLOCK_SIZING: bool, const NULLABLE: bool> {
-    buffer: BlockedBooleanBuilder<FIXED_BLOCK_SIZING>,
-    nulls: BlockedNullsBuilder<FIXED_BLOCK_SIZING>,
-    block_size: usize,
+pub struct BooleanGroupValueBuilder<const NULLABLE: bool> {
+    buffer: BooleanBufferBuilder,
+    nulls: NullBufferBuilder,
 }
 
-impl<const FIXED_BLOCK_SIZING: bool, const NULLABLE: bool> BooleanGroupValueBuilder<FIXED_BLOCK_SIZING, NULLABLE> {
+impl<const NULLABLE: bool> BooleanGroupValueBuilder<NULLABLE> {
     /// Create a new `BooleanGroupValueBuilder`
-    pub fn new(block_size: usize) -> Self {
-        if FIXED_BLOCK_SIZING {
-            assert_ne!(block_size, 0)
-        }
+    pub fn new() -> Self {
         Self {
-            buffer: BlockedBooleanBuilder::new(block_size),
-            nulls: BlockedNullsBuilder::new(block_size),
-            block_size,
+            buffer: BooleanBufferBuilder::new(0),
+            nulls: NullBufferBuilder::empty(),
         }
     }
 }
 
-impl<const FIXED_BLOCK_SIZING: bool, const NULLABLE: bool> GroupColumn<FIXED_BLOCK_SIZING> for BooleanGroupValueBuilder<FIXED_BLOCK_SIZING, NULLABLE> {
-    fn equal_to(&self, lhs_row: BlockedIndex, array: &ArrayRef, rhs_row: usize) -> bool {
+impl<const NULLABLE: bool> GroupColumn for BooleanGroupValueBuilder<NULLABLE> {
+    fn equal_to(&self, lhs_row: usize, array: &ArrayRef, rhs_row: usize) -> bool {
         if NULLABLE {
             let exist_null = self.nulls.is_null(lhs_row);
             let input_null = array.is_null(rhs_row);
@@ -70,10 +64,10 @@ impl<const FIXED_BLOCK_SIZING: bool, const NULLABLE: bool> GroupColumn<FIXED_BLO
     fn append_val(&mut self, array: &ArrayRef, row: usize) -> Result<()> {
         if NULLABLE {
             if array.is_null(row) {
-                self.nulls.push_null();
+                self.nulls.append_null();
                 self.buffer.append(bool::default());
             } else {
-                self.nulls.push_non_null();
+                self.nulls.append_non_null();
                 self.buffer.append(array.as_boolean().value(row));
             }
         } else {
@@ -85,7 +79,7 @@ impl<const FIXED_BLOCK_SIZING: bool, const NULLABLE: bool> GroupColumn<FIXED_BLO
 
     fn vectorized_equal_to(
         &self,
-        lhs_rows: &[BlockedIndex],
+        lhs_rows: &[usize],
         array: &ArrayRef,
         rhs_rows: &[usize],
         equal_to_results: &mut BooleanBufferBuilder,
@@ -133,24 +127,24 @@ impl<const FIXED_BLOCK_SIZING: bool, const NULLABLE: bool> GroupColumn<FIXED_BLO
             (true, Nulls::Some) => {
                 for &row in rows {
                     if array.is_null(row) {
-                        self.nulls.push_null();
+                        self.nulls.append_null();
                         self.buffer.append(bool::default());
                     } else {
-                        self.nulls.push_non_null();
+                        self.nulls.append_non_null();
                         self.buffer.append(arr.value(row));
                     }
                 }
             }
 
             (true, Nulls::None) => {
-                self.nulls.push_n_non_nulls(rows.len());
+                self.nulls.append_n_non_nulls(rows.len());
                 for &row in rows {
                     self.buffer.append(arr.value(row));
                 }
             }
 
             (true, Nulls::All) => {
-                self.nulls.push_n_nulls(rows.len());
+                self.nulls.append_n_nulls(rows.len());
                 self.buffer.append_n(rows.len(), bool::default());
             }
 
@@ -169,59 +163,33 @@ impl<const FIXED_BLOCK_SIZING: bool, const NULLABLE: bool> GroupColumn<FIXED_BLO
     }
 
     fn size(&self) -> usize {
-        self.buffer.allocated_size() + self.nulls.allocated_size()
+        self.buffer.capacity() / 8 + self.nulls.allocated_size()
     }
-    // 
-    // fn build(self: Box<Self>) -> ArrayRef {
-    //     let Self { mut buffer, nulls } = *self;
-    // 
-    //     let nulls = nulls.build();
-    //     if !NULLABLE {
-    //         assert!(nulls.is_none(), "unexpected nulls in non nullable input");
-    //     }
-    // 
-    //     let arr = BooleanArray::new(buffer.finish(), nulls);
-    // 
-    //     Arc::new(arr)
-    // }
-    // 
-    // fn take_n(&mut self, n: usize) -> ArrayRef {
-    //     let first_n_nulls = if NULLABLE { self.nulls.take_n(n) } else { None };
-    // 
-    //     let mut new_builder = BooleanBufferBuilder::new(self.buffer.len());
-    //     new_builder.append_packed_range(n..self.buffer.len(), self.buffer.as_slice());
-    //     std::mem::swap(&mut new_builder, &mut self.buffer);
-    // 
-    //     // take only first n values from the original builder
-    //     new_builder.truncate(n);
-    // 
-    //     Arc::new(BooleanArray::new(new_builder.finish(), first_n_nulls))
-    // }
 
-    fn take_block(&mut self) -> Option<ArrayRef> {
-        let values = self.buffer.take_block();
+    fn build(self: Box<Self>) -> ArrayRef {
+        let Self { mut buffer, nulls } = *self;
 
-        let nulls = if NULLABLE {
-            self.nulls.take_block()
-        } else {
-            // if one have block, the other have block
-            values.as_ref().map(|_| None)
-        };
-        
-
-        match (nulls, values) {
-            (Some(nulls), Some(values)) => Some(Arc::new(BooleanArray::new(values, nulls))),
-            (None, None) => None,
-            (None, Some(_)) => unreachable!("does not have nulls blocks but have values block"),
-            (Some(_), None) => unreachable!("does not have values blocks but have nulls block"),
+        let nulls = nulls.build();
+        if !NULLABLE {
+            assert!(nulls.is_none(), "unexpected nulls in non nullable input");
         }
+
+        let arr = BooleanArray::new(buffer.finish(), nulls);
+
+        Arc::new(arr)
     }
 
-    fn start_new_block(&mut self) {
-        assert!(!FIXED_BLOCK_SIZING, "must not create new block when block sizing is managed internally");
-        
-        self.nulls.start_new_block();
-        self.buffer.start_new_block();
+    fn take_n(&mut self, n: usize) -> ArrayRef {
+        let first_n_nulls = if NULLABLE { self.nulls.take_n(n) } else { None };
+
+        let mut new_builder = BooleanBufferBuilder::new(self.buffer.len());
+        new_builder.append_packed_range(n..self.buffer.len(), self.buffer.as_slice());
+        std::mem::swap(&mut new_builder, &mut self.buffer);
+
+        // take only first n values from the original builder
+        new_builder.truncate(n);
+
+        Arc::new(BooleanArray::new(new_builder.finish(), first_n_nulls))
     }
 }
 

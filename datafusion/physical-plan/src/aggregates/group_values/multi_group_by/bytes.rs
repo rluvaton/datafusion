@@ -15,22 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::execution::aggregates::group_values::multi_group_by::{
+use crate::aggregates::group_values::multi_group_by::{
     GroupColumn, Nulls, nulls_equal_to,
 };
-use crate::execution::aggregates::group_values::null_builder::MaybeNullBufferBuilder;
-use arrow::array::{Array, ArrayRef, AsArray, BooleanBufferBuilder, BufferBuilder, GenericBinaryArray, GenericByteArray, GenericStringArray, OffsetSizeTrait, types::GenericStringType, BinaryArrayType};
+use crate::aggregates::group_values::null_builder::NullBufferBuilderExt;
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanBufferBuilder, BufferBuilder, GenericBinaryArray,
+    GenericByteArray, GenericStringArray, NullBufferBuilder, OffsetSizeTrait,
+    types::GenericStringType,
+};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{ByteArrayType, DataType, GenericBinaryType};
-use datafusion::common::utils::proxy::VecAllocExt;
-use datafusion::common::utils::take_n_offsets;
-use datafusion::common::{Result, exec_datafusion_err};
-use datafusion::physical_expr_common::binary_map::{INITIAL_BUFFER_CAPACITY, OutputType};
+use datafusion_common::utils::proxy::VecAllocExt;
+use datafusion_common::utils::split_vec_min_alloc;
+use datafusion_common::{Result, exec_datafusion_err};
+use datafusion_physical_expr_common::binary_map::{INITIAL_BUFFER_CAPACITY, OutputType};
 use std::mem::size_of;
 use std::sync::Arc;
 use std::vec;
-use crate::execution::aggregates::group_values::blocked_primitives::BlockedByteArrayBuilder;
-use crate::execution::aggregates::group_values::blocked_primitives::BlockedIndex;
 
 /// An implementation of [`GroupColumn`] for binary and utf8 types.
 ///
@@ -39,36 +41,33 @@ use crate::execution::aggregates::group_values::blocked_primitives::BlockedIndex
 ///
 /// 1. Efficient comparison of incoming rows to existing rows
 /// 2. Efficient construction of the final output array
-pub struct ByteGroupValueBuilder<const FIXED_BLOCK_SIZING: bool, O>
+pub struct ByteGroupValueBuilder<O>
 where
     O: OffsetSizeTrait,
 {
     output_type: OutputType,
-    array_builder: BlockedByteArrayBuilder<FIXED_BLOCK_SIZING, GenericBinaryType<O>>,
-
-    // buffer: BufferBuilder<u8>,
-    // /// Offsets into `buffer` for each distinct value. These offsets as used
-    // /// directly to create the final `GenericBinaryArray`. The `i`th string is
-    // /// stored in the range `offsets[i]..offsets[i+1]` in `buffer`. Null values
-    // /// are stored as a zero length string.
-    // offsets: Vec<O>,
-    // /// Nulls
-    // nulls: MaybeNullBufferBuilder,
+    buffer: BufferBuilder<u8>,
+    /// Offsets into `buffer` for each distinct value. These offsets as used
+    /// directly to create the final `GenericBinaryArray`. The `i`th string is
+    /// stored in the range `offsets[i]..offsets[i+1]` in `buffer`. Null values
+    /// are stored as a zero length string.
+    offsets: Vec<O>,
+    /// Nulls
+    nulls: NullBufferBuilder,
     /// The maximum size of the buffer for `0`
     max_buffer_size: usize,
 }
 
-impl<const FIXED_BLOCK_SIZING: bool, O> ByteGroupValueBuilder<FIXED_BLOCK_SIZING, O>
+impl<O> ByteGroupValueBuilder<O>
 where
     O: OffsetSizeTrait,
 {
-    pub fn new(output_type: OutputType, block_size: usize) -> Self {
+    pub fn new(output_type: OutputType) -> Self {
         Self {
             output_type,
-            array_builder: BlockedByteArrayBuilder::new(block_size),
-            // buffer: BufferBuilder::new(INITIAL_BUFFER_CAPACITY),
-            // offsets: vec![O::default()],
-            // nulls: MaybeNullBufferBuilder::new(),
+            buffer: BufferBuilder::new(INITIAL_BUFFER_CAPACITY),
+            offsets: vec![O::default()],
+            nulls: NullBufferBuilder::empty(),
             max_buffer_size: if O::IS_LARGE {
                 i64::MAX as usize
             } else {
@@ -77,7 +76,7 @@ where
         }
     }
 
-    fn equal_to_inner<B>(&self, lhs_row: BlockedIndex, array: &ArrayRef, rhs_row: usize) -> bool
+    fn equal_to_inner<B>(&self, lhs_row: usize, array: &ArrayRef, rhs_row: usize) -> bool
     where
         B: ByteArrayType,
     {
@@ -91,13 +90,12 @@ where
     {
         let arr = array.as_bytes::<B>();
         if arr.is_null(row) {
-            self.array_builder.push_null();
-            // self.nulls.append(true);
-            // // nulls need a zero length in the offset buffer
-            // let offset = self.buffer.len();
-            // self.offsets.push(O::usize_as(offset));
+            self.nulls.append_null();
+            // nulls need a zero length in the offset buffer
+            let offset = self.buffer.len();
+            self.offsets.push(O::usize_as(offset));
         } else {
-            self.array_builder.append_valid();
+            self.nulls.append_non_null();
             self.do_append_val_inner(arr, row)?;
         }
 
@@ -106,7 +104,7 @@ where
 
     fn vectorized_equal_to_inner<B>(
         &self,
-        lhs_rows: &[BlockedIndex],
+        lhs_rows: &[usize],
         array: &ArrayRef,
         rhs_rows: &[usize],
         equal_to_results: &mut BooleanBufferBuilder,
@@ -115,14 +113,14 @@ where
     {
         let array = array.as_bytes::<B>();
 
-        for (idx, (&block_index, &rhs_row)) in
+        for (idx, (&lhs_row, &rhs_row)) in
             lhs_rows.iter().zip(rhs_rows.iter()).enumerate()
         {
             if !equal_to_results.get_bit(idx) {
                 continue;
             }
 
-            if !self.do_equal_to_inner(block_index, array, rhs_row) {
+            if !self.do_equal_to_inner(lhs_row, array, rhs_row) {
                 equal_to_results.set_bit(idx, false);
             }
         }
@@ -155,19 +153,18 @@ where
             }
 
             Nulls::None => {
-                self.array_builder.append_n_valids(rows.len());
-                // self.nulls.append_n(rows.len(), false);
+                self.nulls.append_n_non_nulls(rows.len());
                 for &row in rows {
                     self.do_append_val_inner(arr, row)?;
                 }
             }
 
             Nulls::All => {
-                self.array_builder.append_n_nulls(rows.len());
+                self.nulls.append_n_nulls(rows.len());
 
-                // let new_len = self.offsets.len() + rows.len();
-                // let offset = self.buffer.len();
-                // self.offsets.resize(new_len, O::usize_as(offset));
+                let new_len = self.offsets.len() + rows.len();
+                let offset = self.buffer.len();
+                self.offsets.resize(new_len, O::usize_as(offset));
             }
         }
 
@@ -176,14 +173,14 @@ where
 
     fn do_equal_to_inner<B>(
         &self,
-        lhs_row: BlockedIndex,
+        lhs_row: usize,
         array: &GenericByteArray<B>,
         rhs_row: usize,
     ) -> bool
     where
         B: ByteArrayType,
     {
-        let exist_null = self.array_builder.is_null(lhs_row);
+        let exist_null = self.nulls.is_null(lhs_row);
         let input_null = array.is_null(rhs_row);
         if let Some(result) = nulls_equal_to(exist_null, input_null) {
             return result;
@@ -201,28 +198,33 @@ where
         B: ByteArrayType,
     {
         let value: &[u8] = array.value(row).as_ref();
-        if self.array_builder.current_block_bytes_len() + value.len() > self.max_buffer_size {
+        self.buffer.append_slice(value);
+
+        if self.buffer.len() > self.max_buffer_size {
             return Err(exec_datafusion_err!(
                 "offset overflow, buffer size > {}",
                 self.max_buffer_size
             ));
         }
-        self.array_builder.append_valid_slice(value);
 
+        self.offsets.push(O::usize_as(self.buffer.len()));
         Ok(())
     }
 
     /// return the current value of the specified row irrespective of null
-    pub fn value(&self, row: BlockedIndex) -> &[u8] {
-        self.array_builder.value_bytes(row)
+    pub fn value(&self, row: usize) -> &[u8] {
+        let l = self.offsets[row].as_usize();
+        let r = self.offsets[row + 1].as_usize();
+        // Safety: the offsets are constructed correctly and never decrease
+        unsafe { self.buffer.as_slice().get_unchecked(l..r) }
     }
 }
 
-impl<const FIXED_BLOCK_SIZING: bool, O> GroupColumn<FIXED_BLOCK_SIZING> for ByteGroupValueBuilder<FIXED_BLOCK_SIZING, O>
+impl<O> GroupColumn for ByteGroupValueBuilder<O>
 where
     O: OffsetSizeTrait,
 {
-    fn equal_to(&self, lhs_row: BlockedIndex, column: &ArrayRef, rhs_row: usize) -> bool {
+    fn equal_to(&self, lhs_row: usize, column: &ArrayRef, rhs_row: usize) -> bool {
         // Sanity array type
         match self.output_type {
             OutputType::Binary => {
@@ -268,7 +270,7 @@ where
 
     fn vectorized_equal_to(
         &self,
-        lhs_rows: &[BlockedIndex],
+        lhs_rows: &[usize],
         array: &ArrayRef,
         rhs_rows: &[usize],
         equal_to_results: &mut BooleanBufferBuilder,
@@ -326,106 +328,88 @@ where
     }
 
     fn len(&self) -> usize {
-        self.array_builder.len()
+        self.offsets.len() - 1
     }
 
     fn size(&self) -> usize {
-        self.array_builder.allocated_size()
-        // self.buffer.capacity() * size_of::<u8>()
-        //     + self.offsets.allocated_size()
-        //     + self.nulls.allocated_size()
+        self.buffer.capacity() * size_of::<u8>()
+            + self.offsets.allocated_size()
+            + self.nulls.allocated_size()
     }
 
-    // fn build(self: Box<Self>) -> ArrayRef {
-    //     let Self {
-    //         output_type,
-    //         mut buffer,
-    //         offsets,
-    //         nulls,
-    //         ..
-    //     } = *self;
-    // 
-    //     let null_buffer = nulls.build();
-    // 
-    //     // SAFETY: the offsets were constructed correctly in `insert_if_new` --
-    //     // monotonically increasing, overflows were checked.
-    //     let offsets = unsafe { OffsetBuffer::new_unchecked(ScalarBuffer::from(offsets)) };
-    //     let values = buffer.finish();
-    //     match output_type {
-    //         OutputType::Binary => {
-    //             // SAFETY: the offsets were constructed correctly
-    //             Arc::new(unsafe {
-    //                 GenericBinaryArray::new_unchecked(offsets, values, null_buffer)
-    //             })
-    //         }
-    //         OutputType::Utf8 => {
-    //             // SAFETY:
-    //             // 1. the offsets were constructed safely
-    //             //
-    //             // 2. the input arrays were all the correct type and thus since
-    //             // all the values that went in were valid (e.g. utf8) so are all
-    //             // the values that come out
-    //             Arc::new(unsafe {
-    //                 GenericStringArray::new_unchecked(offsets, values, null_buffer)
-    //             })
-    //         }
-    //         _ => unreachable!("View types should use `ArrowBytesViewMap`"),
-    //     }
-    // }
-    // 
-    // fn take_n(&mut self, n: usize) -> ArrayRef {
-    //     debug_assert!(self.len() >= n);
-    //     let null_buffer = self.nulls.take_n(n);
-    //     let first_remaining_offset = O::as_usize(self.offsets[n]);
-    // 
-    //     let first_n_offsets = take_n_offsets(&mut self.offsets, n);
-    // 
-    //     // SAFETY: the offsets were constructed correctly in `insert_if_new` --
-    //     // monotonically increasing, overflows were checked.
-    //     let offsets =
-    //       unsafe { OffsetBuffer::new_unchecked(ScalarBuffer::from(first_n_offsets)) };
-    // 
-    //     let mut remaining_buffer =
-    //       BufferBuilder::new(self.buffer.len() - first_remaining_offset);
-    //     // TODO: Current approach copy the remaining and truncate the original one
-    //     // Find out a way to avoid copying buffer but split the original one into two.
-    //     remaining_buffer.append_slice(&self.buffer.as_slice()[first_remaining_offset..]);
-    //     self.buffer.truncate(first_remaining_offset);
-    //     let values = self.buffer.finish();
-    //     self.buffer = remaining_buffer;
-    // 
-    //     match self.output_type {
-    //         OutputType::Binary => {
-    //             // SAFETY: the offsets were constructed correctly
-    //             Arc::new(unsafe {
-    //                 GenericBinaryArray::new_unchecked(offsets, values, null_buffer)
-    //             })
-    //         }
-    //         OutputType::Utf8 => {
-    //             // SAFETY:
-    //             // 1. the offsets were constructed safely
-    //             //
-    //             // 2. we asserted the input arrays were all the correct type and
-    //             // thus since all the values that went in were valid (e.g. utf8)
-    //             // so are all the values that come out
-    //             Arc::new(unsafe {
-    //                 GenericStringArray::new_unchecked(offsets, values, null_buffer)
-    //             })
-    //         }
-    //         _ => unreachable!("View types should use `ArrowBytesViewMap`"),
-    //     }
-    // }
+    fn build(self: Box<Self>) -> ArrayRef {
+        let Self {
+            output_type,
+            mut buffer,
+            offsets,
+            nulls,
+            ..
+        } = *self;
 
-    fn take_block(&mut self) -> Option<ArrayRef> {
-        // SAFETY: this was build from valid input
-        let output = unsafe { self.array_builder.take_block_unchecked()? };
+        let null_buffer = nulls.build();
 
-        Some(match self.output_type {
+        // SAFETY: the offsets were constructed correctly in `insert_if_new` --
+        // monotonically increasing, overflows were checked.
+        let offsets = unsafe { OffsetBuffer::new_unchecked(ScalarBuffer::from(offsets)) };
+        let values = buffer.finish();
+        match output_type {
             OutputType::Binary => {
-                Arc::new(output)
+                // SAFETY: the offsets were constructed correctly
+                Arc::new(unsafe {
+                    GenericBinaryArray::new_unchecked(offsets, values, null_buffer)
+                })
             }
             OutputType::Utf8 => {
-                let (offsets, values, null_buffer) = output.into_parts();
+                // SAFETY:
+                // 1. the offsets were constructed safely
+                //
+                // 2. the input arrays were all the correct type and thus since
+                // all the values that went in were valid (e.g. utf8) so are all
+                // the values that come out
+                Arc::new(unsafe {
+                    GenericStringArray::new_unchecked(offsets, values, null_buffer)
+                })
+            }
+            _ => unreachable!("View types should use `ArrowBytesViewMap`"),
+        }
+    }
+
+    fn take_n(&mut self, n: usize) -> ArrayRef {
+        debug_assert!(self.len() >= n);
+        let null_buffer = self.nulls.take_n(n);
+        let first_remaining_offset = O::as_usize(self.offsets[n]);
+
+        // Given offsets like [0, 2, 4, 5] and n = 1, we expect to get
+        // offsets [0, 2, 3]. We first create two offsets for first_n as [0, 2] and the remaining as [2, 4, 5].
+        // And we shift the offset starting from 0 for the remaining one, [2, 4, 5] -> [0, 2, 3].
+        let offset_n = self.offsets[n];
+        let mut first_n_offsets = split_vec_min_alloc(&mut self.offsets, n);
+        // After the split, self.offsets[0] == offset_n in both branches; normalize in-place.
+        self.offsets.iter_mut().for_each(|o| *o = o.sub(offset_n));
+        first_n_offsets.push(offset_n);
+
+        // SAFETY: the offsets were constructed correctly in `insert_if_new` --
+        // monotonically increasing, overflows were checked.
+        let offsets =
+            unsafe { OffsetBuffer::new_unchecked(ScalarBuffer::from(first_n_offsets)) };
+
+        let mut remaining_buffer =
+            BufferBuilder::new(self.buffer.len() - first_remaining_offset);
+        // TODO: Current approach copy the remaining and truncate the original one
+        // Find out a way to avoid copying buffer but split the original one into two.
+        remaining_buffer.append_slice(&self.buffer.as_slice()[first_remaining_offset..]);
+        self.buffer.truncate(first_remaining_offset);
+        let values = self.buffer.finish();
+        self.buffer = remaining_buffer;
+
+        match self.output_type {
+            OutputType::Binary => {
+                // SAFETY: the offsets were constructed correctly
+                Arc::new(unsafe {
+                    GenericBinaryArray::new_unchecked(offsets, values, null_buffer)
+                })
+            }
+            OutputType::Utf8 => {
                 // SAFETY:
                 // 1. the offsets were constructed safely
                 //
@@ -437,12 +421,7 @@ where
                 })
             }
             _ => unreachable!("View types should use `ArrowBytesViewMap`"),
-        })
-    }
-
-    fn start_new_block(&mut self) {
-        assert!(!FIXED_BLOCK_SIZING, "only relevant when block size is externally managed");
-        self.array_builder.start_new_block();
+        }
     }
 }
 
@@ -450,10 +429,10 @@ where
 mod tests {
     use std::sync::Arc;
 
-    use crate::execution::aggregates::group_values::multi_group_by::bytes::ByteGroupValueBuilder;
+    use crate::aggregates::group_values::multi_group_by::bytes::ByteGroupValueBuilder;
     use arrow::array::{ArrayRef, BooleanBufferBuilder, NullBufferBuilder, StringArray};
-    use datafusion::common::DataFusionError;
-    use datafusion::physical_expr::binary_map::OutputType;
+    use datafusion_common::DataFusionError;
+    use datafusion_physical_expr::binary_map::OutputType;
 
     use super::GroupColumn;
 
