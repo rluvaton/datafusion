@@ -1,9 +1,12 @@
+use crate::blocked_helpers::take_n_helpers::{
+    BlockBuilder, create_adjusted_block_size_iter_for_fixed_blocks, take_n_from_blocks,
+};
 use crate::groups_accumulator::BlocksIndex;
+use datafusion_common::utils::proxy::VecDequeAllocExt;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::ops::{Index, IndexMut};
-use datafusion_common::utils::proxy::VecDequeAllocExt;
-use crate::blocked_helpers::take_n_helpers::{take_n_from_blocks, BlockBuilder, create_adjusted_block_size_iter_for_fixed_blocks};
+use std::sync::Arc;
 
 pub trait BlockProvider {
     type Block: Block;
@@ -118,7 +121,10 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
     }
 
     pub fn allocated_size(&self) -> usize {
-        self.blocks_provider.allocated_size() + self.finished_blocks_allocated_memory + self.blocks.allocated_size() + self.blocks.back().map_or(0, |b| b.allocated_size())
+        self.blocks_provider.allocated_size()
+            + self.finished_blocks_allocated_memory
+            + self.blocks.allocated_size()
+            + self.blocks.back().map_or(0, |b| b.allocated_size())
     }
 
     /// Get the number of elements in the current block (not the number of offsets since the first offset is always 0)
@@ -129,7 +135,8 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
     pub fn start_new_block(&mut self) {
         // Don't add to number of blocks since we might not insert into it
         self.current_block_index += 1;
-        self.finished_blocks_allocated_memory += self.blocks.back().map_or(0, |b| b.allocated_size());
+        self.finished_blocks_allocated_memory +=
+            self.blocks.back().map_or(0, |b| b.allocated_size());
         let new_block = self.blocks_provider.new_block();
         self.blocks.push_back(new_block);
     }
@@ -392,13 +399,9 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
 
         if self.blocks.is_empty() {
             self.current_block_index = 0;
-            let prev_blocks_capacity = self.blocks.capacity();
 
             let block = self.blocks_provider.new_block();
-            self.finished_blocks_allocated_memory += block.allocated_size();
             self.blocks.push_back(block);
-            self.finished_blocks_allocated_memory += (self.blocks.capacity() - prev_blocks_capacity)
-                * size_of::<CustomBlockProvider::Block>();
         } else {
             self.current_block_index -= 1;
 
@@ -423,24 +426,52 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
         Some(finished)
     }
 
-    pub fn take_n(&mut self, n: usize, adjusted_block_size_iter: Option<impl Iterator<Item=usize> + Clone>) -> CustomBlockProvider::Block where CustomBlockProvider::Block: BlockBuilder {
+    pub fn take_all(&mut self) -> Vec<CustomBlockProvider::Block> {
+        if self.pending_block {
+            assert_eq!(self.number_of_blocks + 1, self.blocks.len());
+            self.blocks.pop_back();
+        } else {
+            assert_eq!(self.number_of_blocks, self.blocks.len());
+        }
+
+        let mut blocks = std::mem::take(&mut self.blocks);
+
+        let block = self.blocks_provider.new_block();
+        self.blocks.push_back(block);
+
+        self.number_of_blocks = 0;
+        self.current_block_index = 0;
+
+        self.len = 0;
+        self.finished_blocks_allocated_memory = 0;
+        self.pending_block = true;
+
+        blocks.into()
+    }
+
+    pub fn take_n(
+        &mut self,
+        n: usize,
+        adjusted_block_size_iter: Option<impl Iterator<Item = usize> + Clone>,
+    ) -> CustomBlockProvider::Block
+    where
+        CustomBlockProvider::Block: BlockBuilder,
+    {
         assert_eq!(FIXED_BLOCK_SIZING, adjusted_block_size_iter.is_none());
 
         let (taken, layout) = if let Some(iter) = adjusted_block_size_iter {
-            take_n_from_blocks(
-                &mut self.blocks,
-                self.len,
-                n,
-                Some(self.block_size),
-                iter
-            )
+            take_n_from_blocks(&mut self.blocks, self.len, n, Some(self.block_size), iter)
         } else {
             take_n_from_blocks(
                 &mut self.blocks,
                 self.len,
                 n,
                 Some(self.block_size),
-                create_adjusted_block_size_iter_for_fixed_blocks(self.len, n, self.block_size),
+                create_adjusted_block_size_iter_for_fixed_blocks(
+                    self.len,
+                    n,
+                    self.block_size,
+                ),
             )
         };
 
