@@ -21,6 +21,7 @@ use crate::aggregates::group_values::multi_group_by::{
     GroupColumn, Nulls, nulls_equal_to,
 };
 use arrow::array::{Array as _, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder};
+use itertools::Itertools;
 use datafusion_common::Result;
 use datafusion_expr_common::groups_accumulator::BlocksIndex;
 use datafusion_functions_aggregate_common::blocked_helpers::{
@@ -177,32 +178,38 @@ impl<const FIXED_BLOCK_SIZING: bool, const NULLABLE: bool> GroupColumn<FIXED_BLO
     fn size(&self) -> usize {
         self.buffer.allocated_size() + self.nulls.allocated_size()
     }
-    //
-    // fn build(self: Box<Self>) -> ArrayRef {
-    //     let Self { mut buffer, nulls } = *self;
-    //
-    //     let nulls = nulls.build();
-    //     if !NULLABLE {
-    //         assert!(nulls.is_none(), "unexpected nulls in non nullable input");
-    //     }
-    //
-    //     let arr = BooleanArray::new(buffer.finish(), nulls);
-    //
-    //     Arc::new(arr)
-    // }
-    //
-    // fn take_n(&mut self, n: usize) -> ArrayRef {
-    //     let first_n_nulls = if NULLABLE { self.nulls.take_n(n) } else { None };
-    //
-    //     let mut new_builder = BooleanBufferBuilder::new(self.buffer.len());
-    //     new_builder.append_packed_range(n..self.buffer.len(), self.buffer.as_slice());
-    //     std::mem::swap(&mut new_builder, &mut self.buffer);
-    //
-    //     // take only first n values from the original builder
-    //     new_builder.truncate(n);
-    //
-    //     Arc::new(BooleanArray::new(new_builder.finish(), first_n_nulls))
-    // }
+
+    fn build(mut self: Box<Self>) -> Vec<ArrayRef> {
+        let boolean = self.buffer.take_all();
+
+        if !NULLABLE {
+            boolean.into_iter().map(|buffer| Arc::new(BooleanArray::new(buffer, None))).collect()
+        } else {
+            assert_eq!(self.nulls.len(), 0);
+
+            let nulls = self.nulls.take_all();
+            boolean.into_iter().zip_eq(nulls.into_iter()).map(|(buffer, nulls)| Arc::new(BooleanArray::new(buffer, nulls))).collect()
+        }
+    }
+
+
+    fn take_n(
+        &mut self,
+        n: usize,
+        adjusted_block_size: Option<impl Iterator<Item = usize> + Clone>,
+    ) -> ArrayRef {
+        assert_eq!(FIXED_BLOCK_SIZING, adjusted_block_size.is_none());
+        let boolean = self.buffer.take_n(n, adjusted_block_size.clone());
+
+        let nulls = if NULLABLE {
+            self.nulls.take_n(n, adjusted_block_size)
+        } else {
+            assert_eq!(self.nulls.len(), 0, "no nulls should be recorded");
+            None
+        };
+
+        Arc::new(BooleanArray::new(boolean, nulls))
+    }
 
     fn take_block(&mut self) -> Option<ArrayRef> {
         let values = self.buffer.take_block();
@@ -210,6 +217,7 @@ impl<const FIXED_BLOCK_SIZING: bool, const NULLABLE: bool> GroupColumn<FIXED_BLO
         let nulls = if NULLABLE {
             self.nulls.take_block()
         } else {
+            assert_eq!(self.nulls.len(), 0, "no nulls should be recorded");
             // if one have block, the other have block
             values.as_ref().map(|_| None)
         };

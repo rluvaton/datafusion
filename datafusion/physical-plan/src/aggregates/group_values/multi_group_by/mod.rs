@@ -110,12 +110,13 @@ pub trait GroupColumn<const FIXED_BLOCK_SIZING: bool>: Send + Sync {
     /// Returns the number of bytes used by this [`GroupColumn`]
     fn size(&self) -> usize;
 
-    // /// Builds a new array from all of the stored rows
-    // fn build(self: Box<Self>) -> ArrayRef;
-    //
-    // /// Builds a new array from the first `n` stored rows, shifting the
-    // /// remaining rows to the start of the builder
-    // fn take_n(&mut self, n: usize) -> ArrayRef;
+    /// Builds a new blocked array from all of the stored rows
+    fn build(self: Box<Self>) -> Vec<ArrayRef>;
+
+
+    /// Builds a new array from the first `n` stored rows, shifting the
+    /// remaining rows to the start of the builder
+    fn take_n(&mut self, n: usize, adjusted_block_size: Option<impl Iterator<Item=usize> + Clone>) -> ArrayRef;
 
     /// Take the next block
     fn take_block(&mut self) -> Option<ArrayRef>;
