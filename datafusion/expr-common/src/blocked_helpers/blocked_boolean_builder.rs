@@ -2,10 +2,11 @@ use arrow::array::{new_empty_array, BooleanBufferBuilder, AsArray};
 use arrow::buffer::{BooleanBuffer};
 use crate::groups_accumulator::BlocksIndex;
 use std::collections::VecDeque;
-use std::ops::Index;
+use std::ops::{Index, Range};
 use arrow::datatypes::DataType;
 use itertools::Itertools;
 use datafusion_common::utils::proxy::VecDequeAllocExt;
+use crate::blocked_helpers::take_n_helpers::{take_n_from_blocks, BlockBuilder};
 
 #[derive(Debug)]
 pub struct BlockedBooleanBuilder<const FIXED_BLOCK_SIZING: bool> {
@@ -344,154 +345,92 @@ impl BlockedBooleanBuilder<false> {
     ///
     ///
     pub fn take_n(&mut self, n: usize, mut adjusted_block_size_iter: impl Iterator<Item=usize> + Clone) -> BooleanBuffer {
-        assert!(n <= self.len, "n ({n}) must be <= len ({}) than", self.len);
-        assert!(n <= self.blocks[0].len(), "n ({n}) must be lower than the first block ({}), instead use `take_block` and take_n with the remainder", self.blocks[0].len());
+        let (taken, layout) = take_n_from_blocks(
+            &mut self.blocks,
+            self.len,
+            n,
+            None,
+            adjusted_block_size_iter,
+        );
 
-        let prev_len = self.len;
+        self.len = layout.len;
+        self.current_block_index = layout.current_block_index;
+        self.finished_blocks_allocated_size = layout.finished_blocks_allocated_size;
 
-        if n == self.blocks[0].len() {
-            adjusted_block_size_iter.zip_eq(self.blocks.iter().skip(1)).for_each(|(len, current_block)| assert_eq!(len, current_block.len()));
-
-            return self.take_block().expect("must have block");
-        }
-
-        assert_ne!(n, self.len, "n must ne smaller than the first block which is smaller that len");
-
-        // Not moving anything
-        if n == 0 {
-            adjusted_block_size_iter.zip_eq(self.blocks.iter()).for_each(|(len, current_block)| assert_eq!(len, current_block.len(), "when n is 0 and not equal the first block size, we should keep the length as is"));
-
-            return Self::new_empty_buffer();
-        }
-
-        // The emitted values are always fully contained in the first block
-        let mut taken = BooleanBufferBuilder::new(n);
-        taken.append_packed_range(0..n, self.blocks[0].as_slice());
-
-        // Read cursor into the old layout, starts right after the emitted values
-        let mut src_index = 0;
-        let mut src_offset = n;
-
-        // Write cursor into the new layout
-        let mut dst_index = 0;
-
-        let mut sum = 0;
-
-        // Reused for swapping blocks out of the deque, `new(0)` holds no buffer
-        let mut placeholder = BooleanBufferBuilder::new(0);
-
-        while let Some(new_block_size) = adjusted_block_size_iter.next() {
-            sum += new_block_size;
-
-            // Skip over source blocks that were fully read
-            while src_index < self.blocks.len() && src_offset >= self.blocks[src_index].len() {
-                src_index += 1;
-                src_offset = 0;
-            }
-
-            assert!(
-                src_index < self.blocks.len(),
-                "sum of adjusted block sizes + n ({n}) is larger than the length ({prev_len})"
-            );
-
-            // Invariant, the destination never runs ahead of the read cursor
-            // so writing into `dst_index` can never clobber values that were not read yet
-            debug_assert!(dst_index <= src_index);
-
-            if dst_index == src_index {
-                let remaining_in_src = self.blocks[src_index].len() - src_offset;
-
-                if new_block_size < remaining_in_src {
-                    // The old block is being split, its tail is still needed by later
-                    // destinations so it cannot be shifted down in place
-                    // Give the split off part its own slot and push the old block one to the right
-                    let mut split = BooleanBufferBuilder::new(new_block_size);
-                    split.append_packed_range(
-                        src_offset..src_offset + new_block_size,
-                        self.blocks[src_index].as_slice(),
-                    );
-
-                    self.blocks.insert(dst_index, split);
-
-                    src_index += 1;
-                    src_offset += new_block_size;
-                    dst_index += 1;
-                    continue;
-                }
-
-                // The whole tail of this block belongs to the destination, shift it down
-                // over the values that were consumed and reuse the same allocation
-                Self::shift_down_in_place(&mut self.blocks[dst_index], src_offset, remaining_in_src);
-
-                src_index += 1;
-                src_offset = 0;
-
-                if remaining_in_src == new_block_size {
-                    dst_index += 1;
-                    continue;
-                }
-            } else {
-                // This slot held a block that is already fully read, reuse it as an empty destination
-                self.blocks[dst_index].truncate(0);
-            }
-
-            let mut remaining = new_block_size - self.blocks[dst_index].len();
-
-            while remaining > 0 {
-                while src_index < self.blocks.len() && src_offset >= self.blocks[src_index].len() {
-                    src_index += 1;
-                    src_offset = 0;
-                }
-
-                assert!(
-                    src_index < self.blocks.len(),
-                    "sum of adjusted block sizes + n ({n}) is larger than the length ({prev_len}), missing {remaining} items"
-                );
-
-                // Move the source block aside so the destination can be borrowed mutably
-                std::mem::swap(&mut self.blocks[src_index], &mut placeholder);
-
-                let to_copy = (placeholder.len() - src_offset).min(remaining);
-
-                self.blocks[dst_index].append_packed_range(
-                    src_offset..src_offset + to_copy,
-                    placeholder.as_slice(),
-                );
-
-                std::mem::swap(&mut self.blocks[src_index], &mut placeholder);
-
-                src_offset += to_copy;
-                remaining -= to_copy;
-            }
-
-            dst_index += 1;
-        }
-
-        assert_eq!(prev_len, sum + n, "sum of adjusted block sizes ({sum}) + n ({n}) must equal the length {prev_len}");
-
-        // Drop the old blocks that the new layout did not need
-        self.blocks.truncate(dst_index);
-
-        // Never have empty blocks since we won't be able to add more items
-        if self.blocks.is_empty() {
-            self.blocks.push_back(BooleanBufferBuilder::new(self.block_size));
-        }
-
-        // The back block is the one still being written to and is measured separately
-        self.finished_blocks_allocated_size = self
-          .blocks
-          .iter()
-          .take(self.blocks.len() - 1)
-          .map(|b| allocated_size_for_builder(b))
-          .sum();
-
-        self.current_block_index = self.blocks.len() - 1;
-        self.len = sum;
-
-        taken.build()
+        taken
     }
 }
 
+impl BlockBuilder for BooleanBufferBuilder {
+    type Output = BooleanBuffer;
+
+    fn with_capacity(capacity: usize) -> Self {
+        BooleanBufferBuilder::new(capacity)
+    }
+
+    fn len(&self) -> usize {
+        BooleanBufferBuilder::len(self)
+    }
+
+    fn truncate(&mut self, len: usize) {
+        BooleanBufferBuilder::truncate(self, len)
+    }
+
+    fn append_range(&mut self, src: &Self, range: Range<usize>) {
+        self.append_packed_range(range, src.as_slice())
+    }
+
+    fn shift_down(&mut self, offset: usize, len: usize) {
+        if offset == 0 {
+            BooleanBufferBuilder::truncate(self, len);
+            return;
+        }
+
+        let byte_offset = offset / 8;
+        let bit_offset = offset % 8;
+        let dst_bytes = len.div_ceil(8);
+
+        {
+            let bytes = self.as_slice_mut();
+            let src_bytes = bytes.len();
+
+            if bit_offset == 0 {
+                bytes.copy_within(byte_offset..byte_offset + dst_bytes, 0);
+            } else {
+                // Destination byte is always at or below the source byte
+                // so a forward pass never reads a byte that was already overwritten
+                for dst in 0..dst_bytes {
+                    let src = dst + byte_offset;
+
+                    let low = bytes[src] >> bit_offset;
+                    let high = if src + 1 < src_bytes {
+                        bytes[src + 1] << (8 - bit_offset)
+                    } else {
+                        0
+                    };
+
+                    bytes[dst] = low | high;
+                }
+            }
+
+            // Clear the stale bits in the last byte so later appends see zeroed padding
+            let trailing = len % 8;
+            if trailing != 0 {
+                bytes[dst_bytes - 1] &= (1u8 << trailing) - 1;
+            }
+        }
+
+        BooleanBufferBuilder::truncate(self, len);
+    }
+
+    fn allocated_size(&self) -> usize {
+        allocated_size_for_builder(self)
+    }
+
+    fn finish(mut self) -> BooleanBuffer {
+        self.build()
+    }
+}
 
 fn allocated_size_for_builder(builder: &BooleanBufferBuilder) -> usize {
     // capacity returns in bits

@@ -19,6 +19,8 @@ mod blocked_rows_builder;
 pub use blocked_rows_builder::BlockedRowsBuilder;
 mod blocked_custom_input_builder_with_lifetime;
 mod blocked_raw_hash_table_builder;
+pub mod take_n_helpers;
+
 pub use blocked_raw_hash_table_builder::BlockedRawHashTableBuilder;
 
 pub use blocked_custom_input_builder_with_lifetime::BlockedCustomInputBuilderWithLifetime;
