@@ -197,7 +197,7 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedBooleanBuilder<FIXED_BLOCK_SIZING> {
         self.current_block_index = 0;
         self.finished_blocks_allocated_size = 0;
 
-        self.blocks.into_iter().map(|b| b.build()).collect()
+        blocks.into_iter().map(|b| b.build()).collect()
     }
 
     fn new_empty_buffer() -> BooleanBuffer {
