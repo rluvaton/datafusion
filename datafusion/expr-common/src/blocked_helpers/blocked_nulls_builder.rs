@@ -355,7 +355,6 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
     }
 
     pub fn take_block(&mut self) -> Option<Option<NullBuffer>> {
-        let capacity_before = self.blocks.capacity();
         let mut block = self.blocks.pop_front()?;
         let number_of_items = block.len() - 1;
         self.len -= number_of_items;
@@ -371,6 +370,21 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
         }
 
         Some(block.build().filter(|b| b.null_count() > 0))
+    }
+
+    pub fn take_all(&mut self) -> Vec<Option<NullBuffer>> {
+        let blocks = std::mem::take(&mut self.blocks);
+        self.len = 0;
+        self.might_have_nulls = false;
+        self.finished_blocks_allocated_size = 0;
+        self.current_block_index = 0;
+
+        // Never have empty blocks since we won't be able to add more items
+        let empty_block = NullBufferBuilder::new(self.block_size);
+        self.blocks.push_back(empty_block);
+
+
+        blocks.into_iter().map(|item| item.build().filter(|b| b.null_count() > 0)).collect()
     }
 
     pub fn take_n(&mut self, n: usize, adjusted_block_size_iter: Option<impl Iterator<Item=usize> + Clone>) -> Option<NullBuffer> {

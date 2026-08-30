@@ -2,12 +2,13 @@ use super::blocked_bytes_buffer_builder::BlockedBytesBufferBuilder;
 use super::blocked_nulls_builder::BlockedNullsBuilder;
 use super::blocked_offset_buffer_builder::BlockedOffsetBufferBuilder;
 use arrow::array::{Array, ArrayRef, BooleanArray, GenericByteArray, OffsetSizeTrait};
-use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{ArrowNativeType, ByteArrayType};
 use crate::groups_accumulator::BlocksIndex;
 use std::collections::VecDeque;
 use std::ops::{Deref, Index};
 use std::sync::Arc;
+use itertools::Itertools;
 
 pub struct BlockedByteArrayBuilder<const FIXED_BLOCK_SIZING: bool, B: ByteArrayType> {
     blocked_offsets: BlockedOffsetBufferBuilder<FIXED_BLOCK_SIZING, B::Offset>,
@@ -117,7 +118,7 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteArrayType>
 
     pub fn current_block_bytes_len(&self) -> usize {
         // TODO - should always exists
-        self.blocked_bytes.current_block_len().unwrap_or(0)
+        self.blocked_bytes.current_block_len()
     }
 
     /// Extends iterator of lengths within current block
@@ -295,7 +296,36 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteArrayType>
         ))
     }
 
-    fn take_n(
+    pub fn take_all(&mut self) -> Vec<GenericByteArray<B>> {
+        let offsets = self.blocked_offsets.take_all();
+        let blocked_nulls = self.blocked_nulls.take_all();
+        let bytes = self.blocked_bytes.take_all();
+
+        offsets.into_iter().zip_eq(bytes.into_iter()).zip_eq(blocked_nulls.into_iter()).map(|((offsets, bytes), nulls)| {
+            GenericByteArray::new(
+                OffsetBuffer::from(offsets),
+                Buffer::from(bytes),
+                nulls,
+            )
+        }).collect()
+    }
+
+    /// Take all but build blocks unchecked
+    pub unsafe fn take_all_unchecked(&mut self) -> Vec<GenericByteArray<B>> {
+        let offsets = self.blocked_offsets.take_all();
+        let blocked_nulls = self.blocked_nulls.take_all();
+        let bytes = self.blocked_bytes.take_all();
+
+        offsets.into_iter().zip_eq(bytes.into_iter()).zip_eq(blocked_nulls.into_iter()).map(|((offsets, bytes), nulls)| unsafe {
+            GenericByteArray::new_unchecked(
+                OffsetBuffer::from(offsets),
+                Buffer::from(bytes),
+                nulls,
+            )
+        }).collect()
+    }
+
+    pub fn take_n(
         &mut self,
         n: usize,
         adjusted_block_size: Option<impl Iterator<Item = usize> + Clone>,
@@ -310,6 +340,24 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteArrayType>
         );
 
         GenericByteArray::new(offsets, bytes, nulls)
+    }
+
+    /// Take n items but build it unchecked
+    pub unsafe fn take_n_unchecked(
+        &mut self,
+        n: usize,
+        adjusted_block_size: Option<impl Iterator<Item = usize> + Clone>,
+    ) -> GenericByteArray<B> {
+        assert_eq!(FIXED_BLOCK_SIZING, adjusted_block_size.is_none());
+
+        let offsets = OffsetBuffer::from(self.blocked_offsets.take_n(n, adjusted_block_size.clone()));
+        let nulls = self.blocked_nulls.take_n(n, adjusted_block_size.clone());
+        let bytes = self.blocked_bytes.take_n(
+            offsets[offsets.len() - 1].as_usize(),
+            self.blocked_offsets.blocks_iter().map(|block| block[block.len() - 1].as_usize()),
+        );
+
+        GenericByteArray::new_unchecked(offsets, bytes, nulls)
     }
 }
 
