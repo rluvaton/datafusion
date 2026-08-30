@@ -2,7 +2,9 @@ use super::blocked_custom_input_builder_with_lifetime::{
     BlockWithLifetime, BlockWithLifetimeProvider, BlockedCustomInputBuilderWithLifetime,
 };
 use arrow::row::{RowConverter, Rows};
-use std::ops::{Deref, DerefMut};
+use std::ops::{Deref, DerefMut, Range};
+use crate::blocked_helpers::Block;
+use crate::blocked_helpers::take_n_helpers::BlockBuilder;
 
 #[derive(Debug)]
 pub struct BlockedRowsBuilder<const FIXED_BLOCK_SIZING: bool>(
@@ -59,6 +61,10 @@ impl BlockWithLifetimeProvider for RowsBlockProvider {
 
     fn new_block(&self) -> Self::Block {
         self.row_converter.empty_rows(0, 0)
+    }
+
+    fn allocated_size(&self) -> usize {
+        self.row_converter.size()
     }
 }
 

@@ -1,9 +1,11 @@
 use crate::groups_accumulator::BlocksIndex;
-use arrow::array::NullBufferBuilder;
+use arrow::array::{BooleanBufferBuilder, NullBufferBuilder};
 use arrow::buffer::NullBuffer;
 use datafusion_common::utils::proxy::VecDequeAllocExt;
 use std::collections::VecDeque;
-use std::ops::Index;
+use std::ops::{Index, Range};
+use arrow::util::bit_util::apply_bitwise_binary_op;
+use crate::blocked_helpers::take_n_helpers::{take_n_from_blocks, BlockBuilder, create_adjusted_block_size_iter_for_fixed_blocks};
 
 #[derive(Debug)]
 pub struct BlockedNullsBuilder<const FIXED_BLOCK_SIZING: bool> {
@@ -369,6 +371,122 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedNullsBuilder<FIXED_BLOCK_SIZING> {
         }
 
         Some(block.build().filter(|b| b.null_count() > 0))
+    }
+
+    pub fn take_n(&mut self, n: usize, adjusted_block_size_iter: Option<impl Iterator<Item=usize> + Clone>) -> Option<NullBuffer> {
+        assert_eq!(FIXED_BLOCK_SIZING, adjusted_block_size_iter.is_none());
+
+        let (taken, layout) = if let Some(iter) = adjusted_block_size_iter {
+            take_n_from_blocks(
+                &mut self.blocks,
+                self.len,
+                n,
+                Some(self.block_size),
+                iter
+            )
+        } else {
+            take_n_from_blocks(
+                &mut self.blocks,
+                self.len,
+                n,
+                Some(self.block_size),
+                create_adjusted_block_size_iter_for_fixed_blocks(self.len, n, self.block_size),
+            )
+        };
+
+        self.len = layout.len;
+        self.current_block_index = layout.current_block_index;
+        self.finished_blocks_allocated_size = layout.finished_blocks_allocated_size;
+
+        taken
+    }
+}
+
+impl BlockBuilder for NullBufferBuilder {
+    type Output = Option<NullBuffer>;
+
+    fn with_capacity(capacity: usize) -> Self {
+        NullBufferBuilder::new(capacity)
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.truncate(len)
+    }
+
+    fn append_range(&mut self, src: &Self, range: Range<usize>) {
+        let Some(src_slice) = src.as_slice() else {
+            self.append_n_non_nulls(range.len());
+            return;
+        };
+
+        let offset_write = self.len();
+        let len = range.end - range.start;
+        // allocate new bits as 0
+        self.append_n_nulls(len);
+        // copy bits from to_set into self.buffer a word at a time
+        apply_bitwise_binary_op(
+            self.as_slice_mut().expect("must be materialized"),
+            offset_write,
+            src_slice,
+            range.start,
+            len,
+            |_a, b| b, // copy bits from to_set
+        );
+    }
+
+    fn shift_down(&mut self, offset: usize, len: usize) {
+        if offset == 0 {
+            self.truncate(len);
+            return;
+        }
+
+        let byte_offset = offset / 8;
+        let bit_offset = offset % 8;
+        let dst_bytes = len.div_ceil(8);
+
+        if let Some(bytes) = self.as_slice_mut() {
+            let src_bytes = bytes.len();
+
+            if bit_offset == 0 {
+                bytes.copy_within(byte_offset..byte_offset + dst_bytes, 0);
+            } else {
+                // Destination byte is always at or below the source byte
+                // so a forward pass never reads a byte that was already overwritten
+                for dst in 0..dst_bytes {
+                    let src = dst + byte_offset;
+
+                    let low = bytes[src] >> bit_offset;
+                    let high = if src + 1 < src_bytes {
+                        bytes[src + 1] << (8 - bit_offset)
+                    } else {
+                        0
+                    };
+
+                    bytes[dst] = low | high;
+                }
+            }
+
+            // Clear the stale bits in the last byte so later appends see zeroed padding
+            let trailing = len % 8;
+            if trailing != 0 {
+                bytes[dst_bytes - 1] &= (1u8 << trailing) - 1;
+            }
+        }
+
+        // truncate is enough for both materialized (since we just shifted) and non-materialized (since all are the same value) case
+        self.truncate(len)
+    }
+
+    fn allocated_size(&self) -> usize {
+        self.allocated_size()
+    }
+
+    fn finish(self) -> Self::Output {
+        self.build()
     }
 }
 

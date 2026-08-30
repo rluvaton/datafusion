@@ -1,8 +1,10 @@
+use crate::groups_accumulator::BlocksIndex;
 use arrow::array::OffsetSizeTrait;
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use datafusion_common::utils::proxy::{VecAllocExt, VecDequeAllocExt};
-use crate::groups_accumulator::BlocksIndex;
+use itertools::Itertools;
 use std::collections::VecDeque;
+use std::collections::vec_deque::Iter;
 use std::ops::Index;
 
 /// When `FIXED_BLOCK_SIZING` is true, the block size is the `Self::block_size` otherwise,
@@ -68,7 +70,9 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
     }
 
     pub fn allocated_size(&self) -> usize {
-        self.finished_memory + self.blocks.allocated_size() + self.blocks.back().map_or_else(0, |b| b.allocated_size())
+        self.finished_memory
+            + self.blocks.allocated_size()
+            + self.blocks.back().map_or_else(0, |b| b.allocated_size())
     }
 
     /// Get the number of elements in the current block (not the number of offsets since the first offset is always 0)
@@ -89,7 +93,11 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
         self.current_block_index += 1;
         self.last_offset = O::zero();
         let new_block = vec![self.last_offset];
-        self.finished_memory += self.blocks.back().as_ref().map_or_else(0, |b| b.allocated_size());
+        self.finished_memory += self
+            .blocks
+            .back()
+            .as_ref()
+            .map_or_else(0, |b| b.allocated_size());
         self.blocks.push_back(new_block);
     }
 
@@ -107,7 +115,10 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
     pub fn push_next_offset_in_block(&mut self, next_offset_in_block: O) -> bool {
         let mut block = &mut self.blocks[self.current_block_index];
 
-        assert!(next_offset_in_block >= self.last_offset, "offsets must be monotonically increasing");
+        assert!(
+            next_offset_in_block >= self.last_offset,
+            "offsets must be monotonically increasing"
+        );
         self.last_offset = next_offset_in_block;
         block.push(self.last_offset);
         self.len += 1;
@@ -536,6 +547,371 @@ impl<const FIXED_BLOCK_SIZING: bool, O: OffsetSizeTrait>
         let offsets = unsafe { OffsetBuffer::new_unchecked(inner) };
 
         Some(offsets)
+    }
+
+    pub fn take_all(&mut self) -> Vec<Vec<O>> {
+        let blocks = std::mem::take(&mut self.blocks);
+        assert_ne!(blocks.len(), 0);
+
+        assert_eq!(self.current_block_index, blocks.len() - 1);
+
+        // TODO - should preallocate? can be expensive for large schema
+        self.blocks.push_back(vec![O::zero()]);
+        self.len = 0;
+        self.current_block_index = 0;
+        self.finished_memory = 0;
+        self.number_of_blocks = 0;
+        self.pending_block = true;
+        self.last_offset = O::zero();
+
+        blocks.into_iter().map(|b| b.build()).collect()
+    }
+
+    /// Take the first `n` values
+    ///
+    /// `block_size_iterator` is iterator over the number of items in each block **after** emitting `n`
+    ///
+    /// this is `None` when `FIXED_BLOCK_SIZING` is true
+    ///
+    /// The adjusted iterator must meet this requirement:
+    /// ```
+    /// assert_eq!(n + adjusted_block_size_iter.sum(), self.len);
+    /// ```
+    ///
+    /// TODO - shrink to fit
+    ///
+    ///
+    pub fn take_n(
+        &mut self,
+        n: usize,
+        adjusted_block_size_iter: Option<impl Iterator<Item = usize> + Clone>,
+    ) -> Vec<O> {
+        assert_eq!(FIXED_BLOCK_SIZING, adjusted_block_size_iter.is_none());
+        if let Some(adjusted_block_size_iter) = adjusted_block_size_iter {
+            self.take_n_dynamic(n, adjusted_block_size_iter)
+        } else {
+            self.take_n_fixed(n)
+        }
+    }
+
+    fn take_n_dynamic(
+        &mut self,
+        n: usize,
+        mut adjusted_block_size_iter: impl Iterator<Item = usize> + Clone,
+    ) -> Vec<O> {
+        let first_block_items = self.blocks[0].len() - 1;
+
+        assert!(n <= self.len, "n ({n}) must be <= len ({}) than", self.len);
+        assert!(
+            n <= first_block_items,
+            "n ({n}) must be lower than the first block ({first_block_items}), instead use `take_block` and take_n with the remainder"
+        );
+
+        let prev_len = self.len;
+
+        if n == first_block_items {
+            adjusted_block_size_iter
+              .zip_eq(self.blocks.iter().skip(1))
+              .for_each(|(len, current_block)| assert_eq!(len, current_block.len() - 1));
+
+            return self.take_block().expect("must have block");
+        }
+
+        assert_ne!(
+            n, self.len,
+            "n must ne smaller than the first block which is smaller that len"
+        );
+
+        // Not moving anything
+        if n == 0 {
+            adjusted_block_size_iter
+              .zip_eq(self.blocks.iter())
+              .for_each(|(len, current_block)| {
+                  assert_eq!(
+                      len,
+                      current_block.len() - 1,
+                      "when n is 0 and not equal the first block size, we should keep the length as is"
+                  )
+              });
+
+            return vec![O::zero()];
+        }
+
+        // The emitted items are always fully contained in the first block, its initial
+        // offset is already zero so the emitted offsets need no rebasing
+        let mut taken = Vec::with_capacity(n + 1);
+        taken.extend_from_slice(&self.blocks[0][..=n]);
+
+        // Read cursor into the old layout, starts right after the emitted items
+        let mut src_index = 0;
+        let mut src_offset = n;
+
+        // Write cursor into the new layout
+        let mut dst_index = 0;
+
+        let mut sum = 0;
+
+        // Reused for swapping blocks out of the deque, an empty vec holds no buffer
+        let mut placeholder = Vec::new();
+
+        while let Some(new_block_size) = adjusted_block_size_iter.next() {
+            sum += new_block_size;
+
+            // Skip over source blocks that were fully read
+            while src_index < self.blocks.len()
+              && src_offset >= self.blocks[src_index].len() - 1
+            {
+                src_index += 1;
+                src_offset = 0;
+            }
+
+            assert!(
+                src_index < self.blocks.len(),
+                "sum of adjusted block sizes + n ({n}) is larger than the length ({prev_len})"
+            );
+
+            // Invariant, the destination never runs ahead of the read cursor
+            // so writing into `dst_index` can never clobber items that were not read yet
+            debug_assert!(dst_index <= src_index);
+
+            if dst_index == src_index {
+                let remaining_in_src = self.blocks[src_index].len() - 1 - src_offset;
+
+                if new_block_size < remaining_in_src {
+                    // The old block is being split, its tail is still needed by later
+                    // destinations so it cannot be shifted down in place
+                    // Give the split off part its own slot and push the old block one to the right
+                    let mut split = Vec::with_capacity(new_block_size + 1);
+                    let base = self.blocks[src_index][src_offset];
+
+                    split.extend(
+                        self.blocks[src_index][src_offset..=src_offset + new_block_size]
+                          .iter()
+                          .map(|offset| *offset - base),
+                    );
+
+                    self.blocks.insert(dst_index, split);
+
+                    src_index += 1;
+                    src_offset += new_block_size;
+                    dst_index += 1;
+                    continue;
+                }
+
+                // The whole tail of this block belongs to the destination, shift it down
+                // over the items that were consumed and reuse the same allocation
+                Self::shift_offsets_down_in_place(&mut self.blocks[dst_index], src_offset);
+
+                src_index += 1;
+                src_offset = 0;
+
+                if remaining_in_src == new_block_size {
+                    dst_index += 1;
+                    continue;
+                }
+            } else {
+                // This slot held a block that is already fully read, reuse it as an empty destination
+                let block = &mut self.blocks[dst_index];
+                block.truncate(1);
+                block[0] = O::zero();
+            }
+
+            let mut remaining = new_block_size - (self.blocks[dst_index].len() - 1);
+
+            self.blocks[dst_index].reserve(remaining);
+
+            while remaining > 0 {
+                while src_index < self.blocks.len()
+                  && src_offset >= self.blocks[src_index].len() - 1
+                {
+                    src_index += 1;
+                    src_offset = 0;
+                }
+
+                assert!(
+                    src_index < self.blocks.len(),
+                    "sum of adjusted block sizes + n ({n}) is larger than the length ({prev_len}), missing {remaining} items"
+                );
+
+                // Move the source block aside so the destination can be borrowed mutably
+                std::mem::swap(&mut self.blocks[src_index], &mut placeholder);
+
+                let to_copy = (placeholder.len() - 1 - src_offset).min(remaining);
+
+                // The source block is relative to its own start, so the moved items are
+                // rebased onto the last offset of the destination
+                let base = placeholder[src_offset];
+                let block = &mut self.blocks[dst_index];
+                let last_offset = block[block.len() - 1];
+
+                block.extend(
+                    placeholder[src_offset + 1..=src_offset + to_copy]
+                      .iter()
+                      .map(|offset| last_offset + (*offset - base)),
+                );
+
+                std::mem::swap(&mut self.blocks[src_index], &mut placeholder);
+
+                src_offset += to_copy;
+                remaining -= to_copy;
+            }
+
+            dst_index += 1;
+        }
+
+        assert_eq!(
+            prev_len,
+            sum + n,
+            "sum of adjusted block sizes ({sum}) + n ({n}) must equal the length {prev_len}"
+        );
+
+        // Drop the old blocks that the new layout did not need
+        self.blocks.truncate(dst_index);
+
+        // Never have zero blocks since we won't be able to add more items
+        if self.blocks.is_empty() {
+            self.blocks.push_back(vec![O::zero()]);
+        }
+
+        // The back block is the one still being written to and is measured separately
+        self.finished_memory = self
+          .blocks
+          .iter()
+          .take(self.blocks.len() - 1)
+          .map(|b| b.allocated_size())
+          .sum();
+
+        self.current_block_index = self.blocks.len() - 1;
+        self.number_of_blocks = self.blocks.len();
+        self.pending_block = false;
+        self.len = sum;
+        self.last_offset = *self.blocks[self.current_block_index]
+          .last()
+          .expect("every block holds at least the initial offset");
+
+        taken
+    }
+
+    /// Drops the first `items` items of the block and rebases the remaining offsets to zero
+    /// reusing the same allocation
+    fn shift_offsets_down_in_place(block: &mut Vec<O>, items: usize) {
+        if items == 0 {
+            return;
+        }
+
+        let block_len = block.len();
+
+        block.copy_within(items.., 0);
+        block.truncate(block_len - items);
+
+        let base = block[0];
+        if base > O::zero() {
+            block.iter_mut().for_each(|offset| *offset = *offset - base);
+        }
+    }
+
+    fn take_n_fixed(&mut self, n: usize) -> Vec<O> {
+        assert!(n <= self.len, "n ({n}) must be <= len ({}) than", self.len);
+        assert!(
+            n <= self.block_size - 1,
+            "n ({n}) must be lower than block size ({}), instead use `take_block` and take_n with the remainder",
+            self.block_size
+        );
+
+        if n == self.len || n == self.block_size - 1 {
+            return self.take_block().expect("must have block");
+        }
+
+        assert_ne!(
+            n, self.len,
+            "n must ne smaller than the first block which is smaller that len"
+        );
+
+        // Every block other than the last one holds exactly `block_size - 1` items and `n`
+        // is smaller than that, so the emitted items are always fully contained in the first block
+        let mut taken = Vec::with_capacity(n + 1);
+        taken.extend_from_slice(&self.blocks[0][..=n]);
+
+        // Reused for swapping blocks out of the deque, an empty vec holds no buffer
+        let mut placeholder = Vec::new();
+
+        // Shift every block down by `n` items and refill it from the front of the next one
+        // so that all blocks but the last keep holding exactly `block_size - 1` items
+        for index in 0..self.blocks.len() {
+            {
+                let block = &mut self.blocks[index];
+                let block_len = block.len();
+                let items_in_block = block_len - 1;
+
+                if items_in_block <= n {
+                    // Only reachable for the last block, everything it held was already
+                    // pulled into the previous block
+                    block.truncate(1);
+                    block[0] = O::zero();
+                } else {
+                    // Drop the first `n` items, the offset that starts the remaining items
+                    // becomes the new initial offset of the block
+                    block.copy_within(n.., 0);
+                    block.truncate(block_len - n);
+
+                    // Blocks are self relative so the offsets have to be rebased to zero
+                    let base = block[0];
+                    if base > O::zero() {
+                        block.iter_mut().for_each(|offset| *offset = *offset - base);
+                    }
+                }
+            }
+
+            let next_index = index + 1;
+
+            if next_index < self.blocks.len() {
+                // Move the next block aside so the current one can be borrowed mutably
+                // it has not been shifted yet, so its first `n` items are the ones we want
+                std::mem::swap(&mut self.blocks[next_index], &mut placeholder);
+
+                let items_in_next = placeholder.len() - 1;
+                let to_copy = n.min(items_in_next);
+
+                let base = placeholder[0];
+                let block = &mut self.blocks[index];
+                let mut last_offset = block[block.len() - 1];
+
+                for moved in &placeholder[1..=to_copy] {
+                    last_offset += *moved - base;
+                    block.push(last_offset);
+                }
+
+                std::mem::swap(&mut self.blocks[next_index], &mut placeholder);
+            }
+        }
+
+        self.len -= n;
+
+        // The last block is allowed to be empty, which is the state `start_new_block` leaves
+        // behind when a block fills up exactly
+        let items_per_block = self.block_size - 1;
+        let new_blocks_count = self.len / items_per_block + 1;
+
+        while self.blocks.len() > new_blocks_count {
+            // The back block is measured separately so dropping it needs no adjustment
+            self.blocks.pop_back();
+
+            // Whatever is now at the back stopped being a finished block
+            self.finished_memory -= self.blocks.back().map_or(0, |b| b.allocated_size());
+
+            self.number_of_blocks = self.number_of_blocks.saturating_sub(1);
+        }
+
+        self.current_block_index = self.blocks.len() - 1;
+        self.last_offset = *self.blocks[self.current_block_index]
+            .last()
+            .expect("every block holds at least the initial offset");
+
+        taken
+    }
+
+    pub fn blocks_iter(&self) -> Iter<Vec<O>> {
+        self.blocks.iter()
     }
 }
 

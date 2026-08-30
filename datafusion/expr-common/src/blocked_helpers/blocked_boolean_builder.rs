@@ -1,12 +1,12 @@
-use arrow::array::{new_empty_array, BooleanBufferBuilder, AsArray};
-use arrow::buffer::{BooleanBuffer};
+use crate::blocked_helpers::take_n_helpers::{BlockBuilder, take_n_from_blocks};
 use crate::groups_accumulator::BlocksIndex;
+use arrow::array::{AsArray, BooleanBufferBuilder, new_empty_array};
+use arrow::buffer::BooleanBuffer;
+use arrow::datatypes::DataType;
+use datafusion_common::utils::proxy::VecDequeAllocExt;
+use itertools::Itertools;
 use std::collections::VecDeque;
 use std::ops::{Index, Range};
-use arrow::datatypes::DataType;
-use itertools::Itertools;
-use datafusion_common::utils::proxy::VecDequeAllocExt;
-use crate::blocked_helpers::take_n_helpers::{take_n_from_blocks, BlockBuilder};
 
 #[derive(Debug)]
 pub struct BlockedBooleanBuilder<const FIXED_BLOCK_SIZING: bool> {
@@ -46,7 +46,12 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedBooleanBuilder<FIXED_BLOCK_SIZING> {
     }
 
     pub fn allocated_size(&self) -> usize {
-        self.finished_blocks_allocated_size + self.blocks.allocated_size() + self.blocks.back().map_or(0, |b| allocated_size_for_builder(b))
+        self.finished_blocks_allocated_size
+            + self.blocks.allocated_size()
+            + self
+                .blocks
+                .back()
+                .map_or(0, |b| allocated_size_for_builder(b))
     }
 
     pub fn block_size(&self) -> usize {
@@ -59,7 +64,10 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedBooleanBuilder<FIXED_BLOCK_SIZING> {
 
     pub fn start_new_block(&mut self) {
         self.current_block_index += 1;
-        self.finished_blocks_allocated_size += self.blocks.back().map_or(0, |b| allocated_size_for_builder(b));
+        self.finished_blocks_allocated_size += self
+            .blocks
+            .back()
+            .map_or(0, |b| allocated_size_for_builder(b));
         let new_block = BooleanBufferBuilder::new(self.block_size);
         self.blocks.push_back(new_block);
     }
@@ -193,12 +201,129 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedBooleanBuilder<FIXED_BLOCK_SIZING> {
         assert_eq!(self.current_block_index, blocks.len() - 1);
 
         // TODO - should preallocate? can be expensive for large schema
-        self.blocks.push_back(BooleanBufferBuilder::new(self.block_size));
+        self.blocks
+            .push_back(BooleanBufferBuilder::new(self.block_size));
         self.len = 0;
         self.current_block_index = 0;
         self.finished_blocks_allocated_size = 0;
 
         blocks.into_iter().map(|b| b.build()).collect()
+    }
+
+    /// Take the first `n` values
+    ///
+    /// `block_size_iterator` is iterator over the number of items in each block **after** emitting `n`
+    ///
+    /// this is `None` when `FIXED_BLOCK_SIZING` is true
+    ///
+    /// The adjusted iterator must meet this requirement:
+    /// ```
+    /// assert_eq!(n + adjusted_block_size_iter.sum(), self.len);
+    /// ```
+    ///
+    /// TODO - shrink to fit
+    ///
+    ///
+    pub fn take_n(
+        &mut self,
+        n: usize,
+        adjusted_block_size_iter: Option<impl Iterator<Item = usize> + Clone>,
+    ) -> BooleanBuffer {
+        assert_eq!(FIXED_BLOCK_SIZING, adjusted_block_size_iter.is_none());
+        if let Some(adjusted_block_size_iter) = adjusted_block_size_iter {
+            let (taken, layout) = take_n_from_blocks(
+                &mut self.blocks,
+                self.len,
+                n,
+                None,
+                adjusted_block_size_iter,
+            );
+
+            self.len = layout.len;
+            self.current_block_index = layout.current_block_index;
+            self.finished_blocks_allocated_size = layout.finished_blocks_allocated_size;
+
+            taken
+        } else {
+            assert!(n <= self.len, "n ({n}) must be <= len ({}) than", self.len);
+            assert!(
+                n <= self.block_size,
+                "n ({n}) must be lower than block size ({}), instead use `take_block` and take_n with the remainder",
+                self.block_size
+            );
+
+            if n == self.len || n == self.block_size {
+                return self.take_block().expect("must have block");
+            }
+
+            assert_ne!(
+                n, self.len,
+                "n must ne smaller than the first block which is smaller that len"
+            );
+
+            // Not moving anything
+            if n == 0 {
+                return Self::new_empty_buffer();
+            }
+
+            // Every block other than the last one is exactly `block_size` long and `n` is smaller
+            // than that, so the emitted values are always fully contained in the first block
+            let mut taken = BooleanBufferBuilder::new(n);
+            taken.append_packed_range(0..n, self.blocks[0].as_slice());
+
+            // Reused for swapping blocks out of the deque, `new(0)` holds no buffer
+            let mut placeholder = BooleanBufferBuilder::new(0);
+
+            // Shift every block down by `n` and refill it from the front of the next one
+            // so that all blocks but the last stay exactly `block_size` long
+            for index in 0..self.blocks.len() {
+                let block_len = self.blocks[index].len();
+
+                if block_len <= n {
+                    // Only reachable for the last block, everything it held was already
+                    // pulled into the previous block
+                    self.blocks[index].truncate(0);
+                } else {
+                    Self::shift_down_in_place(&mut self.blocks[index], n, block_len - n);
+                }
+
+                let next_index = index + 1;
+
+                if next_index < self.blocks.len() {
+                    // Move the next block aside so the current one can be borrowed mutably
+                    // it has not been shifted yet, so its first `n` values are the ones we want
+                    std::mem::swap(&mut self.blocks[next_index], &mut placeholder);
+
+                    let to_copy = n.min(placeholder.len());
+
+                    self.blocks[index]
+                        .append_packed_range(0..to_copy, placeholder.as_slice());
+
+                    std::mem::swap(&mut self.blocks[next_index], &mut placeholder);
+                }
+            }
+
+            self.len -= n;
+
+            // The last block is allowed to be empty, which is the state `start_new_block` leaves
+            // behind when a block fills up exactly
+            let new_blocks_count = self.len / self.block_size + 1;
+
+            while self.blocks.len() > new_blocks_count {
+                // The back block is measured separately so dropping it needs no adjustment
+                self.blocks.pop_back();
+
+                // Whatever is now at the back stopped being a finished block
+                self.finished_blocks_allocated_size -= self
+                    .blocks
+                    .back()
+                    .map_or(0, |b| allocated_size_for_builder(b));
+            }
+
+            self.current_block_index = self.blocks.len() - 1;
+
+            taken.build()
+        }
     }
 
     fn new_empty_buffer() -> BooleanBuffer {
@@ -250,114 +375,6 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedBooleanBuilder<FIXED_BLOCK_SIZING> {
         }
 
         block.truncate(len);
-    }
-}
-
-impl BlockedBooleanBuilder<true> {
-
-    ///
-    pub fn take_n(&mut self, n: usize) -> BooleanBuffer {
-        assert!(n <= self.len, "n ({n}) must be <= len ({}) than", self.len);
-        assert!(n <= self.block_size, "n ({n}) must be lower than block size ({}), instead use `take_block` and take_n with the remainder", self.block_size);
-
-        if n == self.len || n == self.block_size {
-            return self.take_block().expect("must have block");
-        }
-
-        assert_ne!(n, self.len, "n must ne smaller than the first block which is smaller that len");
-
-        // Not moving anything
-        if n == 0 {
-            return Self::new_empty_buffer();
-        }
-
-        // Every block other than the last one is exactly `block_size` long and `n` is smaller
-        // than that, so the emitted values are always fully contained in the first block
-        let mut taken = BooleanBufferBuilder::new(n);
-        taken.append_packed_range(0..n, self.blocks[0].as_slice());
-
-        // Reused for swapping blocks out of the deque, `new(0)` holds no buffer
-        let mut placeholder = BooleanBufferBuilder::new(0);
-
-        // Shift every block down by `n` and refill it from the front of the next one
-        // so that all blocks but the last stay exactly `block_size` long
-        for index in 0..self.blocks.len() {
-            let block_len = self.blocks[index].len();
-
-            if block_len <= n {
-                // Only reachable for the last block, everything it held was already
-                // pulled into the previous block
-                self.blocks[index].truncate(0);
-            } else {
-                Self::shift_down_in_place(&mut self.blocks[index], n, block_len - n);
-            }
-
-            let next_index = index + 1;
-
-            if next_index < self.blocks.len() {
-                // Move the next block aside so the current one can be borrowed mutably
-                // it has not been shifted yet, so its first `n` values are the ones we want
-                std::mem::swap(&mut self.blocks[next_index], &mut placeholder);
-
-                let to_copy = n.min(placeholder.len());
-
-                self.blocks[index].append_packed_range(0..to_copy, placeholder.as_slice());
-
-                std::mem::swap(&mut self.blocks[next_index], &mut placeholder);
-            }
-        }
-
-        self.len -= n;
-
-        // The last block is allowed to be empty, which is the state `start_new_block` leaves
-        // behind when a block fills up exactly
-        let new_blocks_count = self.len / self.block_size + 1;
-
-        while self.blocks.len() > new_blocks_count {
-            // The back block is measured separately so dropping it needs no adjustment
-            self.blocks.pop_back();
-
-            // Whatever is now at the back stopped being a finished block
-            self.finished_blocks_allocated_size -= self
-              .blocks
-              .back()
-              .map_or(0, |b| allocated_size_for_builder(b));
-        }
-
-        self.current_block_index = self.blocks.len() - 1;
-
-        taken.build()
-    }
-}
-
-impl BlockedBooleanBuilder<false> {
-
-    /// Take the first `n` values
-    ///
-    /// `block_size_iterator` is iterator over the number of items in each block **after** emitting `n`
-    ///
-    /// The adjusted iterator must meet this requirement:
-    /// ```
-    /// assert_eq!(n + adjusted_block_size_iter.sum(), self.len);
-    /// ```
-    ///
-    /// TODO - shrink to fit
-    ///
-    ///
-    pub fn take_n(&mut self, n: usize, mut adjusted_block_size_iter: impl Iterator<Item=usize> + Clone) -> BooleanBuffer {
-        let (taken, layout) = take_n_from_blocks(
-            &mut self.blocks,
-            self.len,
-            n,
-            None,
-            adjusted_block_size_iter,
-        );
-
-        self.len = layout.len;
-        self.current_block_index = layout.current_block_index;
-        self.finished_blocks_allocated_size = layout.finished_blocks_allocated_size;
-
-        taken
     }
 }
 

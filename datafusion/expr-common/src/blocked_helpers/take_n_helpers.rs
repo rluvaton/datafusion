@@ -36,6 +36,14 @@ pub(crate) struct BlocksLayout {
   pub finished_blocks_allocated_size: usize,
 }
 
+pub fn create_adjusted_block_size_iter_for_fixed_blocks(len: usize, n: usize, block_size: usize) -> impl Iterator<Item = usize> + Clone {
+  let new_len = len - n;
+  let should_have_remainder = new_len % block_size != 0;
+  std::iter::repeat_n(block_size, new_len / block_size).chain(
+    std::iter::repeat_n(new_len % block_size, should_have_remainder as usize),
+  )
+}
+
 /// Takes the first `n` items out of `blocks` and re-blocks whatever is left
 /// according to `adjusted_block_size_iter`
 ///

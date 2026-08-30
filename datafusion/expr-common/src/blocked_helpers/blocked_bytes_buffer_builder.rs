@@ -145,43 +145,6 @@ impl BlockedBytesBufferBuilder {
     }
 }
 
-
-impl BlockBuilder for Vec<u8> {
-    type Output = Vec<u8>;
-
-    fn with_capacity(capacity: usize) -> Self {
-        Vec::with_capacity(capacity)
-    }
-
-    fn len(&self) -> usize {
-        self.as_slice().len()
-    }
-
-    fn truncate(&mut self, len: usize) {
-        Vec::truncate(self, len)
-    }
-
-    fn append_range(&mut self, src: &Self, range: Range<usize>) {
-        self.extend_from_slice(&src[range])
-    }
-
-    fn shift_down(&mut self, offset: usize, len: usize) {
-        if offset > 0 {
-            self.copy_within(offset..offset + len, 0);
-        }
-
-        Vec::truncate(self, len)
-    }
-
-    fn allocated_size(&self) -> usize {
-        self.allocated_size()
-    }
-
-    fn finish(self) -> Vec<u8> {
-        self
-    }
-}
-
 impl<'a> Extend<&'a [u8]> for BlockedBytesBufferBuilder {
     fn extend<T: IntoIterator<Item = &'a [u8]>>(&mut self, iter: T) {
         let block = &mut self.blocks.back_mut().unwrap();

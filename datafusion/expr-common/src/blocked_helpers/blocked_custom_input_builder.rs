@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::ops::{Index, IndexMut};
 use datafusion_common::utils::proxy::VecDequeAllocExt;
+use crate::blocked_helpers::take_n_helpers::{take_n_from_blocks, BlockBuilder, create_adjusted_block_size_iter_for_fixed_blocks};
 
 pub trait BlockProvider {
     type Block: Block;
@@ -420,6 +421,34 @@ impl<const FIXED_BLOCK_SIZING: bool, CustomBlockProvider: BlockProvider>
         let finished = self.blocks_provider.finish(block);
 
         Some(finished)
+    }
+
+    pub fn take_n(&mut self, n: usize, adjusted_block_size_iter: Option<impl Iterator<Item=usize> + Clone>) -> CustomBlockProvider::Block where CustomBlockProvider::Block: BlockBuilder {
+        assert_eq!(FIXED_BLOCK_SIZING, adjusted_block_size_iter.is_none());
+
+        let (taken, layout) = if let Some(iter) = adjusted_block_size_iter {
+            take_n_from_blocks(
+                &mut self.blocks,
+                self.len,
+                n,
+                Some(self.block_size),
+                iter
+            )
+        } else {
+            take_n_from_blocks(
+                &mut self.blocks,
+                self.len,
+                n,
+                Some(self.block_size),
+                create_adjusted_block_size_iter_for_fixed_blocks(self.len, n, self.block_size),
+            )
+        };
+
+        self.len = layout.len;
+        self.current_block_index = layout.current_block_index;
+        self.finished_blocks_allocated_memory = layout.finished_blocks_allocated_size;
+
+        taken
     }
 
     pub fn reset(&mut self) {

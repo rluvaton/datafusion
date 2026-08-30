@@ -5,7 +5,8 @@ use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::ArrowNativeType;
 use datafusion_common::utils::proxy::VecAllocExt;
 use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut};
+use std::ops::{Deref, DerefMut, Range};
+use crate::blocked_helpers::take_n_helpers::BlockBuilder;
 
 #[derive(Debug)]
 pub struct BlockedVecBuilder<const FIXED_BLOCK_SIZING: bool, T>(
@@ -99,5 +100,41 @@ impl<T: Clone> BlockWithSlice for Vec<T> {
 
     fn append_n(&mut self, item: Self::Item, n: usize) {
         self.resize(self.len() + n, item)
+    }
+}
+
+impl<T: Clone> BlockBuilder for Vec<T> {
+    type Output = Vec<T>;
+
+    fn with_capacity(capacity: usize) -> Self {
+        Vec::with_capacity(capacity)
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn truncate(&mut self, len: usize) {
+        Vec::truncate(self, len)
+    }
+
+    fn append_range(&mut self, src: &Self, range: Range<usize>) {
+        self.extend_from_slice(&src[range])
+    }
+
+    fn shift_down(&mut self, offset: usize, len: usize) {
+        if offset > 0 {
+            self.copy_within(offset..offset + len, 0);
+        }
+
+        Vec::truncate(self, len)
+    }
+
+    fn allocated_size(&self) -> usize {
+        self.allocated_size()
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self
     }
 }

@@ -1,12 +1,13 @@
 use super::blocked_bytes_buffer_builder::BlockedBytesBufferBuilder;
 use super::blocked_nulls_builder::BlockedNullsBuilder;
 use super::blocked_offset_buffer_builder::BlockedOffsetBufferBuilder;
-use arrow::array::{Array, GenericByteArray, OffsetSizeTrait};
+use arrow::array::{Array, ArrayRef, BooleanArray, GenericByteArray, OffsetSizeTrait};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{ArrowNativeType, ByteArrayType};
 use crate::groups_accumulator::BlocksIndex;
 use std::collections::VecDeque;
 use std::ops::{Deref, Index};
+use std::sync::Arc;
 
 pub struct BlockedByteArrayBuilder<const FIXED_BLOCK_SIZING: bool, B: ByteArrayType> {
     blocked_offsets: BlockedOffsetBufferBuilder<FIXED_BLOCK_SIZING, B::Offset>,
@@ -292,6 +293,23 @@ impl<const FIXED_BLOCK_SIZING: bool, B: ByteArrayType>
             bytes,
             blocked_nulls,
         ))
+    }
+
+    fn take_n(
+        &mut self,
+        n: usize,
+        adjusted_block_size: Option<impl Iterator<Item = usize> + Clone>,
+    ) -> GenericByteArray<B> {
+        assert_eq!(FIXED_BLOCK_SIZING, adjusted_block_size.is_none());
+
+        let offsets = OffsetBuffer::from(self.blocked_offsets.take_n(n, adjusted_block_size.clone()));
+        let nulls = self.blocked_nulls.take_n(n, adjusted_block_size.clone());
+        let bytes = self.blocked_bytes.take_n(
+            offsets[offsets.len() - 1].as_usize(),
+            self.blocked_offsets.blocks_iter().map(|block| block[block.len() - 1].as_usize()),
+        );
+
+        GenericByteArray::new(offsets, bytes, nulls)
     }
 }
 
