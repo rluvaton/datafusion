@@ -24,6 +24,7 @@ pub mod bytes_view;
 // mod fixed_size_binary;
 pub mod primitive;
 pub mod row_backed;
+mod list;
 
 use std::mem::{self, size_of};
 
@@ -56,6 +57,7 @@ use datafusion_physical_expr::binary_map::OutputType;
 
 use datafusion_expr_common::groups_accumulator::BlocksIndex;
 use hashbrown::hash_table::HashTable;
+use crate::aggregates::group_values::multi_group_by::list::ListGroupValueBuilder;
 
 const NON_INLINED_FLAG: u64 = 0x8000000000000000;
 const VALUE_MASK: u64 = 0x7FFFFFFFFFFFFFFF;
@@ -1146,6 +1148,12 @@ fn make_group_column<const FIXED_BLOCK_SIZING: bool>(
             } else {
                 v.push(Box::new(BooleanGroupValueBuilder::<FIXED_BLOCK_SIZING, false>::new(block_size)));
             }
+        }
+        DataType::List(f) => {
+            v.push(Box::new(ListGroupValueBuilder::<FIXED_BLOCK_SIZING, i32>::new(f.clone(), block_size, make_group_column::<false>(field, block_size)?)));
+        }
+        DataType::LargeList(f) => {
+            v.push(Box::new(ListGroupValueBuilder::<FIXED_BLOCK_SIZING, i64>::new(f.clone(), block_size, make_group_column::<false>(field, block_size)?)));
         }
         // DataType::Dictionary(ref key_dt, ref value_dt) => {
         //     let new_field = Field::new("", *value_dt.clone(), true);
