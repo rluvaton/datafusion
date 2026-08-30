@@ -272,7 +272,9 @@ impl<const FIXED_BLOCK_SIZING: bool, T: ArrowPrimitiveType, const NULLABLE: bool
 
     fn start_new_block(&mut self) {
         self.group_values.start_new_block();
-        self.nulls.start_new_block();
+        if NULLABLE {
+            self.nulls.start_new_block();
+        }
     }
 }
 

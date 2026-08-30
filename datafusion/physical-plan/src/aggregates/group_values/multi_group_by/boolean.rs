@@ -242,7 +242,9 @@ impl<const FIXED_BLOCK_SIZING: bool, const NULLABLE: bool> GroupColumn<FIXED_BLO
             "must not create new block when block sizing is managed internally"
         );
 
-        self.nulls.start_new_block();
+        if NULLABLE {
+            self.nulls.start_new_block();
+        }
         self.buffer.start_new_block();
     }
 }
