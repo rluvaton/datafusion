@@ -18,11 +18,7 @@
 use crate::aggregates::group_values::multi_group_by::{
     GroupColumn, Nulls, nulls_equal_to,
 };
-use arrow::array::{
-    Array, ArrayRef, AsArray, BinaryArrayType, BooleanBufferBuilder, BufferBuilder,
-    GenericBinaryArray, GenericByteArray, GenericStringArray, OffsetSizeTrait,
-    types::GenericStringType,
-};
+use arrow::array::{types::GenericStringType, Array, ArrayRef, AsArray, BinaryArrayType, BooleanArray, BooleanBufferBuilder, BufferBuilder, GenericBinaryArray, GenericByteArray, GenericStringArray, OffsetSizeTrait};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{ByteArrayType, DataType, GenericBinaryType};
 use datafusion_common::utils::proxy::VecAllocExt;
@@ -425,6 +421,23 @@ where
     //         _ => unreachable!("View types should use `ArrowBytesViewMap`"),
     //     }
     // }
+
+    fn build(mut self: Box<Self>) -> Vec<ArrayRef> {
+        self.array_builder.take_all().into_iter().map(Arc::new).collect()
+    }
+
+    fn take_n(
+        &mut self,
+        n: usize,
+        adjusted_block_size: Option<impl Iterator<Item = usize> + Clone>,
+    ) -> ArrayRef {
+        assert_eq!(FIXED_BLOCK_SIZING, adjusted_block_size.is_none());
+
+        // SAFETY: this was build from valid input
+        let output = unsafe { self.array_builder.take_n_unchecked(n, adjusted_block_size) };
+
+        Arc::new(output)
+    }
 
     fn take_block(&mut self) -> Option<ArrayRef> {
         // SAFETY: this was build from valid input
