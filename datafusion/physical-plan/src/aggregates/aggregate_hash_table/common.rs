@@ -24,6 +24,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, internal_err};
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::{EmitTo, GroupsAccumulator};
+use datafusion_expr_common::groups_accumulator::{BlockedGroupsAccumulator, BlocksIndex};
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 
 use crate::PhysicalExpr;
@@ -143,7 +144,7 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
             .collect::<Result<_>>()?;
 
         let group_schema = agg.group_by.group_schema(&input_schema)?;
-        let group_values = new_group_values(group_schema, &GroupOrdering::None)?;
+        let group_values = new_group_values(group_schema, &GroupOrdering::None, batch_size)?;
 
         let metrics = AggregateTableMetrics::new(agg, partition);
 
@@ -416,7 +417,7 @@ pub(super) type AggregateAccumulator = HashAggregateAccumulator;
 pub(super) type AggregateBatchFn = fn(
     &mut AggregateAccumulator,
     &EvaluatedAccumulatorArgs,
-    &[usize],
+    &[BlocksIndex],
     usize,
 ) -> Result<()>;
 
@@ -473,7 +474,7 @@ pub(super) struct AggregateHashTableBuffer {
     ///
     /// Each value indexes into `group_values`, and the same index is used by every
     /// accumulator to update that group's aggregate state.
-    pub(super) batch_group_indices: Vec<usize>,
+    pub(super) batch_group_indices: Vec<BlocksIndex>,
 
     /// One item per aggregate expression.
     ///
@@ -603,7 +604,7 @@ impl HashAggregateAccumulator {
     pub(super) fn update_batch(
         &mut self,
         values: &EvaluatedAccumulatorArgs,
-        group_indices: &[usize],
+        group_indices: &[BlocksIndex],
         total_num_groups: usize,
     ) -> Result<()> {
         let filter = values.filter.as_ref().map(|filter| filter.as_boolean());
@@ -618,7 +619,7 @@ impl HashAggregateAccumulator {
     pub(super) fn merge_batch(
         &mut self,
         values: &EvaluatedAccumulatorArgs,
-        group_indices: &[usize],
+        group_indices: &[BlocksIndex],
         total_num_groups: usize,
     ) -> Result<()> {
         debug_assert!(values.filter.is_none());

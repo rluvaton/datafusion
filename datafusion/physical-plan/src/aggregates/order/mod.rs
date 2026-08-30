@@ -20,6 +20,7 @@ use std::mem::size_of;
 use arrow::array::ArrayRef;
 use datafusion_common::Result;
 use datafusion_expr::EmitTo;
+use datafusion_expr_common::groups_accumulator::BlocksIndex;
 
 mod full;
 mod partial;
@@ -41,14 +42,14 @@ pub enum GroupOrdering {
 
 impl GroupOrdering {
     /// Create a `GroupOrdering` for the specified ordering
-    pub fn try_new(mode: &InputOrderMode) -> Result<Self> {
+    pub fn try_new(mode: &InputOrderMode, block_size: usize) -> Result<Self> {
         match mode {
             InputOrderMode::Linear => Ok(GroupOrdering::None),
             InputOrderMode::PartiallySorted(order_indices) => {
-                GroupOrderingPartial::try_new(order_indices.clone())
+                GroupOrderingPartial::try_new(order_indices.clone(), block_size)
                     .map(GroupOrdering::Partial)
             }
-            InputOrderMode::Sorted => Ok(GroupOrdering::Full(GroupOrderingFull::new())),
+            InputOrderMode::Sorted => Ok(GroupOrdering::Full(GroupOrderingFull::new(block_size))),
         }
     }
 
@@ -128,7 +129,7 @@ impl GroupOrdering {
     pub fn new_groups(
         &mut self,
         batch_group_values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[BlocksIndex],
         total_num_groups: usize,
     ) -> Result<()> {
         match self {

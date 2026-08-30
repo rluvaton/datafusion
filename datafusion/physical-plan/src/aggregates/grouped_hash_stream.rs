@@ -1220,7 +1220,7 @@ impl GroupedHashAggregateStream {
                 self.aggregate_accumulator_metrics.time(
                     idx,
                     AccumulatorPhase::Update,
-                    || acc.update_batch(args, &[0], Some(&false_filter), total_groups),
+                    || acc.update_batch(args, &[BlocksIndex::new_in_first_block(0)], Some(&false_filter), total_groups),
                 )?;
             }
         }
@@ -1232,27 +1232,30 @@ impl GroupedHashAggregateStream {
     /// This process helps in reducing memory pressure by allowing the data to be
     /// read back with streaming merge.
     fn spill(&mut self) -> Result<()> {
-        // Emit and sort intermediate aggregation state
-        let Some(emit) = self.emit(EmitTo::All, true)? else {
-            return Ok(());
-        };
+        loop {
+            // Emit and sort intermediate aggregation state
+            let Some(emit) = self.emit(true)? else {
+                self.clear_shrink(0);
+                return Ok(());
+            };
 
-        // Free accumulated state now that data has been emitted into `emit`.
-        // This must happen before reserving sort memory so the pool has room.
-        // Use 0 to minimize allocated capacity and maximize memory available for sorting.
-        self.clear_shrink(0);
-        self.update_memory_reservation()?;
+            // Free accumulated state now that data has been emitted into `emit`.
+            // This must happen before reserving sort memory so the pool has room.
+            // Use 0 to minimize allocated capacity and maximize memory available for sorting.
+            // TODO - clear
+            // self.clear_shrink(0);
+            self.update_memory_reservation()?;
 
-        let batch_size_ratio = self.batch_size as f32 / emit.num_rows() as f32;
-        let batch_memory = get_record_batch_memory_size(&emit);
-        // The maximum worst case for a sort is 2X the original underlying buffers(regardless of slicing)
-        // First we get the underlying buffers' size, then we get the sliced("actual") size of the batch,
-        // and multiply it by the ratio of batch_size to actual size to get the estimated memory needed for sorting the batch.
-        // If something goes wrong in get_sliced_size()(double counting or something),
-        // we fall back to the worst case.
-        let sort_memory = (batch_memory
-            + (emit.get_sliced_size()? as f32 * batch_size_ratio) as usize)
-            .min(batch_memory * 2);
+            let batch_size_ratio = self.batch_size as f32 / emit.num_rows() as f32;
+            let batch_memory = get_record_batch_memory_size(&emit);
+            // The maximum worst case for a sort is 2X the original underlying buffers(regardless of slicing)
+            // First we get the underlying buffers' size, then we get the sliced("actual") size of the batch,
+            // and multiply it by the ratio of batch_size to actual size to get the estimated memory needed for sorting the batch.
+            // If something goes wrong in get_sliced_size()(double counting or something),
+            // we fall back to the worst case.
+            let sort_memory = (batch_memory
+              + (emit.get_sliced_size()? as f32 * batch_size_ratio) as usize)
+              .min(batch_memory * 2);
 
         // If we can't grow even that, we have no choice but to return an error since we can't spill to disk without sorting the data first.
         self.reservation.try_grow(sort_memory).map_err(|err| {
@@ -1277,21 +1280,20 @@ impl GroupedHashAggregateStream {
         // Shrink the memory we allocated for sorting as the sorting is fully done at this point.
         self.reservation.shrink(sort_memory);
 
-        match spillfile {
-            Some((spillfile, max_record_batch_memory)) => {
-                self.spill_state.spills.push(SortedSpillFile {
-                    file: spillfile,
-                    max_record_batch_memory,
-                })
-            }
-            None => {
-                return internal_err!(
-                    "Calling spill with no intermediate batch to spill"
-                );
+            match spillfile {
+                Some((spillfile, max_record_batch_memory)) => {
+                    self.spill_state.spills.push(SortedSpillFile {
+                        file: spillfile,
+                        max_record_batch_memory,
+                    })
+                }
+                None => {
+                    return internal_err!(
+                        "Calling spill with no intermediate batch to spill"
+                    );
+                }
             }
         }
-
-        Ok(())
     }
 
     /// Clear memory and shrink capacities to the given number of rows.
@@ -1367,7 +1369,7 @@ impl GroupedHashAggregateStream {
 
             // We can now use `GroupOrdering::Full` since the spill files are sorted
             // on the grouping columns.
-            self.group_ordering = GroupOrdering::Full(GroupOrderingFull::new());
+            self.group_ordering = GroupOrdering::Full(GroupOrderingFull::new(self.batch_size));
 
             // Recreate `group_values` for streaming merge so group ids are assigned
             // in first-seen order, as required by `GroupOrderingFull`.
@@ -1378,7 +1380,7 @@ impl GroupedHashAggregateStream {
                 .merging_group_by
                 .group_schema(&self.spill_state.spill_schema)?;
             if group_schema.fields().len() > 1 {
-                self.group_values = new_group_values(group_schema, &self.group_ordering)?;
+                self.group_values = new_group_values(group_schema, &self.group_ordering, self.batch_size)?;
             }
 
             // Use `OutOfMemoryMode::ReportError` from this point on

@@ -26,6 +26,7 @@ use datafusion_common::utils::{compare_rows, get_row_at_idx};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::EmitTo;
+use datafusion_expr_common::groups_accumulator::BlocksIndex;
 
 /// Tracks grouping state when the data is ordered by some subset of
 /// the group keys.
@@ -71,6 +72,8 @@ pub struct GroupOrderingPartial {
     /// For example if grouping by `id, state` and ordered by `state`
     /// this would be `[1]`.
     order_indices: Vec<usize>,
+
+    block_size: usize,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -89,12 +92,12 @@ enum State {
     /// Data is in progress.
     InProgress {
         /// Smallest group index with the sort_key
-        current_sort: usize,
+        current_sort: BlocksIndex,
         /// The sort key of group_index `current_sort`
         sort_key: Vec<ScalarValue>,
         /// index of the current group for which values are being
         /// generated
-        current: usize,
+        current: BlocksIndex,
     },
 
     /// Seen end of input, all groups can be emitted
@@ -117,11 +120,12 @@ impl State {
 
 impl GroupOrderingPartial {
     /// TODO: Remove unnecessary `input_schema` parameter.
-    pub fn try_new(order_indices: Vec<usize>) -> Result<Self> {
+    pub fn try_new(order_indices: Vec<usize>, block_size: usize) -> Result<Self> {
         debug_assert!(!order_indices.is_empty());
         Ok(Self {
             state: State::Start,
             order_indices,
+            block_size
         })
     }
 
@@ -193,11 +197,11 @@ impl GroupOrderingPartial {
     }
 
     fn updated_sort_key(
-        current_sort: usize,
+        current_sort: BlocksIndex,
         sort_key: Option<Vec<ScalarValue>>,
-        range_current_sort: usize,
+        range_current_sort: BlocksIndex,
         range_sort_key: Vec<ScalarValue>,
-    ) -> Result<(usize, Vec<ScalarValue>)> {
+    ) -> Result<(BlocksIndex, Vec<ScalarValue>)> {
         if let Some(sort_key) = sort_key {
             let sort_options = vec![SortOptions::new(false, false); sort_key.len()];
             let ordering = compare_rows(&sort_key, &range_sort_key, &sort_options)?;
@@ -214,17 +218,17 @@ impl GroupOrderingPartial {
     pub fn new_groups(
         &mut self,
         batch_group_values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[BlocksIndex],
         total_num_groups: usize,
     ) -> Result<()> {
         assert!(total_num_groups > 0);
         assert!(!batch_group_values.is_empty());
 
-        let max_group_index = total_num_groups - 1;
+        let max_group_index = BlocksIndex::from_index_in_fixed_block_size(total_num_groups - 1, self.block_size);
 
         let (current_sort, sort_key) = match std::mem::take(&mut self.state) {
             State::Taken => unreachable!("State previously taken"),
-            State::Start => (0, None),
+            State::Start => (BlocksIndex::new_in_first_block(0), None),
             State::InProgress {
                 current_sort,
                 sort_key,

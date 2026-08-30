@@ -27,7 +27,7 @@ use datafusion_common::Result;
 use datafusion_common::assert_or_internal_err;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::EmitTo;
-
+use datafusion_expr_common::groups_accumulator::BlocksIndex;
 use crate::InputOrderMode;
 use crate::PhysicalExpr;
 use crate::aggregates::group_values::{
@@ -163,7 +163,7 @@ pub(super) struct OrderedAggregateTableBuffer {
     pub(super) group_values: Box<dyn GroupValues>,
 
     /// Scratch group id vector for the current input batch.
-    pub(super) group_indices: Vec<usize>,
+    pub(super) group_indices: Vec<BlocksIndex>,
 
     /// One item per aggregate expression.
     ///
@@ -194,9 +194,9 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
             "OrderedAggregateTable requires config batch_size >= 1"
         );
 
-        let group_ordering = GroupOrdering::try_new(input_order_mode)?;
+        let group_ordering = GroupOrdering::try_new(input_order_mode, batch_size)?;
         let group_schema = agg.group_by.group_schema(input_schema)?;
-        let group_values = new_group_values(group_schema, &group_ordering)?;
+        let group_values = new_group_values(group_schema, &group_ordering, batch_size)?;
         let aggregate_arguments = aggregate_expressions(
             &agg.aggr_expr,
             aggregate_mode,
@@ -320,23 +320,32 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
     /// before replay.
     pub(in crate::aggregates) fn take_state_batch(
         &mut self,
-    ) -> Result<Option<RecordBatch>> {
+    ) -> Result<Vec<RecordBatch>> {
         if self.buffer.group_values.is_empty() {
-            return Ok(None);
+            return Ok(vec![]);
         }
 
         let accumulator_metrics = Arc::clone(&self.aggregate_accumulator_metrics);
-        let mut output = self.buffer.group_values.emit(EmitTo::All)?;
-        for (idx, acc) in self.buffer.accumulators.iter_mut().enumerate() {
-            output.extend(accumulator_metrics.time(
-                idx,
-                AccumulatorPhase::State,
-                || acc.state(EmitTo::All),
-            )?);
+
+        let number_of_blocks = self.buffer.group_values.len().div_ceil(self.batch_size);
+
+        let mut blocks = Vec::with_capacity(number_of_blocks);
+        for _ in 0..number_of_blocks {
+            let mut output = self.buffer.group_values.emit_block()?;
+            for (idx, acc) in self.buffer.accumulators.iter_mut().enumerate() {
+                output.extend(accumulator_metrics.time(
+                    idx,
+                    AccumulatorPhase::State,
+                    || acc.state(),
+                )?);
+            }
+
+            let batch = RecordBatch::try_new(Arc::clone(&self.state_schema), output)?;
+            debug_assert!(batch.num_rows() > 0);
+
+            blocks.push(batch);
         }
 
-        let batch = RecordBatch::try_new(Arc::clone(&self.state_schema), output)?;
-        debug_assert!(batch.num_rows() > 0);
 
         // `emit(EmitTo::All)` resets accumulator state. Explicitly shrink the
         // key/index buffers too so the memory reservation can be released
@@ -346,7 +355,7 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
         self.buffer.group_indices.shrink_to_fit();
         self.buffer.group_ordering.reset();
 
-        Ok(Some(batch))
+        Ok(blocks)
     }
 
     /// Returns the [`EmitTo`], clamped to the specified batch size

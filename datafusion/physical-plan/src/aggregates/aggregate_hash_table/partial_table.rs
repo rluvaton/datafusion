@@ -80,7 +80,7 @@ impl AggregateHashTable<PartialMarker> {
     ) -> Result<AggregateHashTable<PartialSkipMarker>> {
         let state = self.state.building();
         let group_schema = state.group_by.group_schema(&self.input_schema)?;
-        let group_values = new_group_values(group_schema, &GroupOrdering::None)?;
+        let group_values = new_group_values(group_schema, &GroupOrdering::None, self.batch_size)?;
         let accumulators = state
             .accumulators
             .iter()
@@ -189,7 +189,7 @@ impl AggregateHashTable<PartialMarker> {
                     filter: Some(Arc::new(false_filter.clone())),
                 };
                 accumulator_metrics.time(idx, AccumulatorPhase::Update, || {
-                    acc.update_batch(&values, &[0], total_groups)
+                    acc.update_batch(&values, &[BlocksIndex::new_in_first_block(0)], total_groups)
                 })?;
             }
         }

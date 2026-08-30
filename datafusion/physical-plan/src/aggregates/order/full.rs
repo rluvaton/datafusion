@@ -17,6 +17,7 @@
 
 use datafusion_expr::EmitTo;
 use std::mem::size_of;
+use datafusion_expr_common::groups_accumulator::BlocksIndex;
 
 /// Tracks grouping state when the data is ordered entirely by its
 /// group keys
@@ -57,6 +58,7 @@ use std::mem::size_of;
 #[derive(Debug)]
 pub struct GroupOrderingFull {
     state: State,
+    block_size: usize,
 }
 
 #[derive(Debug)]
@@ -66,16 +68,17 @@ enum State {
 
     /// Data is in progress. `current` is the current group for which
     /// values are being generated. Can emit `current` - 1
-    InProgress { current: usize },
+    InProgress { current: BlocksIndex },
 
     /// Seen end of input: all groups can be emitted
     Complete,
 }
 
 impl GroupOrderingFull {
-    pub fn new() -> Self {
+    pub fn new(block_size: usize) -> Self {
         Self {
             state: State::Start,
+            block_size,
         }
     }
 
@@ -126,7 +129,7 @@ impl GroupOrderingFull {
         assert_ne!(total_num_groups, 0);
 
         // Update state
-        let max_group_index = total_num_groups - 1;
+        let max_group_index = BlocksIndex::from_index_in_fixed_block_size(total_num_groups - 1, self.block_size);
         self.state = match self.state {
             State::Start => State::InProgress {
                 current: max_group_index,
@@ -146,11 +149,5 @@ impl GroupOrderingFull {
 
     pub(crate) fn size(&self) -> usize {
         size_of::<Self>()
-    }
-}
-
-impl Default for GroupOrderingFull {
-    fn default() -> Self {
-        Self::new()
     }
 }
