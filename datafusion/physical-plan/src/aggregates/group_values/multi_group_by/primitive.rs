@@ -34,6 +34,7 @@ use datafusion_functions_aggregate_common::blocked_helpers::{
 };
 use std::iter;
 use std::sync::Arc;
+use itertools::Itertools;
 
 /// An implementation of [`GroupColumn`] for primitive values
 ///
@@ -256,6 +257,45 @@ impl<const FIXED_BLOCK_SIZING: bool, T: ArrowPrimitiveType, const NULLABLE: bool
         self.group_values.allocated_size() + self.nulls.allocated_size()
     }
 
+    fn build(mut self: Box<Self>) -> Vec<ArrayRef> {
+        let buffers = self.group_values.take_all();
+
+        if NULLABLE {
+            let nulls = self.nulls.take_all();
+
+            buffers.into_iter().zip_eq(nulls).map(|(b, nulls)| {
+                let buffer = ScalarBuffer::from(b);
+                Arc::new(
+                    PrimitiveArray::<T>::new(buffer, nulls)
+                      .with_data_type(self.data_type.clone()),
+                )
+            }).collect()
+        } else {
+            assert_eq!(self.nulls.len(), 0);
+            buffers.into_iter().map(|b| {
+                let buffer = ScalarBuffer::from(b);
+                Arc::new(
+                    PrimitiveArray::<T>::new(buffer, None)
+                      .with_data_type(self.data_type.clone()),
+                )
+            }).collect()
+        }
+    }
+
+    fn take_n(&mut self, n: usize, adjusted_block_size: Option<impl Iterator<Item=usize> + Clone>) -> ArrayRef {
+        let nulls = if NULLABLE {
+            self.nulls.take_n(n, adjusted_block_size.clone())
+        } else {
+            None
+        };
+        let values = self.group_values.take_n(n, adjusted_block_size)?;
+
+        Arc::new(
+            PrimitiveArray::<T>::new(values, nulls)
+              .with_data_type(self.data_type.clone()),
+        )
+    }
+
     fn take_block(&mut self) -> Option<ArrayRef> {
         let values_block = self.group_values.take_block_finished()?;
         let nulls = if NULLABLE {
@@ -266,7 +306,7 @@ impl<const FIXED_BLOCK_SIZING: bool, T: ArrowPrimitiveType, const NULLABLE: bool
 
         Some(Arc::new(
             PrimitiveArray::<T>::new(values_block, nulls)
-                .with_data_type(self.data_type.clone()),
+              .with_data_type(self.data_type.clone()),
         ))
     }
 
