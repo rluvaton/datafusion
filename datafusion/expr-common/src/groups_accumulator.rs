@@ -374,6 +374,12 @@ impl PartialOrd for BlocksIndex {
     }
 }
 
+impl Ord for BlocksIndex {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.block_index.cmp(&other.block_index).then(self.index_in_block.cmp(&other.index_in_block))
+    }
+}
+
 /// `BlocksGroupsAccumulator` implements a single aggregate (e.g. AVG) and
 /// stores the state for *all* groups internally in predefined blocks.
 ///
