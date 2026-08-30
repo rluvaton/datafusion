@@ -22,18 +22,20 @@ mod bytes;
 pub mod bytes_view;
 // mod dictionary;
 // mod fixed_size_binary;
+mod list;
 pub mod primitive;
 pub mod row_backed;
-mod list;
 
 use std::mem::{self, size_of};
 
 use crate::aggregates::group_values::GroupValues;
 use crate::aggregates::group_values::multi_group_by::{
-    boolean::BooleanGroupValueBuilder, bytes::ByteGroupValueBuilder,
+    boolean::BooleanGroupValueBuilder,
+    bytes::ByteGroupValueBuilder,
     bytes_view::ByteViewGroupValueBuilder,
     // fixed_size_binary::FixedSizeBinaryGroupValueBuilder,
-    primitive::PrimitiveGroupValueBuilder, row_backed::RowsGroupColumn,
+    primitive::PrimitiveGroupValueBuilder,
+    row_backed::RowsGroupColumn,
 };
 use arrow::array::{Array, ArrayRef, BooleanBufferBuilder};
 use arrow::compute::cast;
@@ -50,14 +52,17 @@ use arrow::datatypes::{
 };
 use datafusion_common::hash_utils::RandomState;
 use datafusion_common::hash_utils::create_hashes;
-use datafusion_common::{internal_datafusion_err, internal_err, not_impl_err, Result};
+use datafusion_common::{
+    ExprSchema, Result, internal_datafusion_err, internal_err, not_impl_err,
+};
 use datafusion_execution::memory_pool::proxy::{HashTableAllocExt, VecAllocExt};
 use datafusion_expr::EmitTo;
 use datafusion_physical_expr::binary_map::OutputType;
 
 use datafusion_expr_common::groups_accumulator::BlocksIndex;
-use hashbrown::hash_table::HashTable;
 use crate::aggregates::group_values::multi_group_by::list::ListGroupValueBuilder;
+use datafusion_expr_common::groups_accumulator::{BlockedEmitTo, BlocksIndex};
+use hashbrown::hash_table::HashTable;
 
 const NON_INLINED_FLAG: u64 = 0x8000000000000000;
 const VALUE_MASK: u64 = 0x7FFFFFFFFFFFFFFF;
@@ -113,10 +118,13 @@ pub trait GroupColumn<const FIXED_BLOCK_SIZING: bool>: Send + Sync {
     /// Builds a new blocked array from all of the stored rows
     fn build(self: Box<Self>) -> Vec<ArrayRef>;
 
-
     /// Builds a new array from the first `n` stored rows, shifting the
     /// remaining rows to the start of the builder
-    fn take_n(&mut self, n: usize, adjusted_block_size: Option<impl Iterator<Item=usize> + Clone>) -> ArrayRef;
+    fn take_n(
+        &mut self,
+        n: usize,
+        adjusted_block_size: Option<impl Iterator<Item = usize> + Clone>,
+    ) -> ArrayRef;
 
     /// Take the next block
     fn take_block(&mut self) -> Option<ArrayRef>;
@@ -458,7 +466,10 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                     group_idx
                 }
             };
-            groups.push(BlocksIndex::from_index_in_fixed_block_size(group_idx, self.block_size));
+            groups.push(BlocksIndex::from_index_in_fixed_block_size(
+                group_idx,
+                self.block_size,
+            ));
         }
 
         Ok(())
@@ -582,7 +593,10 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                     .push(row);
 
                 // Set group index to row in `groups`
-                groups[row] = BlocksIndex::from_index_in_fixed_block_size(current_group_idx, self.block_size);
+                groups[row] = BlocksIndex::from_index_in_fixed_block_size(
+                    current_group_idx,
+                    self.block_size,
+                );
 
                 continue;
             };
@@ -603,7 +617,10 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                     .equal_to_row_indices
                     .extend(std::iter::repeat_n(row, group_index_list.len()));
             } else {
-                let group_index = BlocksIndex::from_index_in_fixed_block_size(group_index_view.value() as usize, self.block_size);
+                let group_index = BlocksIndex::from_index_in_fixed_block_size(
+                    group_index_view.value() as usize,
+                    self.block_size,
+                );
                 self.vectorized_operation_buffers
                     .equal_to_row_indices
                     .push(row);
@@ -838,7 +855,10 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                 // Create new `group_index_list` including
                 // `exist group index` + `new group index`.
                 // Add new `group_index_list` into ``group_index_lists`.
-                let exist_group_index = BlocksIndex::from_index_in_fixed_block_size(group_index_view.value() as usize, self.block_size);
+                let exist_group_index = BlocksIndex::from_index_in_fixed_block_size(
+                    group_index_view.value() as usize,
+                    self.block_size,
+                );
                 let new_group_index_list = vec![exist_group_index, group_idx];
                 self.group_index_lists.push(new_group_index_list);
 
@@ -1051,28 +1071,126 @@ fn make_group_column<const FIXED_BLOCK_SIZING: bool>(
     let data_type = field.data_type();
     let mut v: Vec<Box<dyn GroupColumn<FIXED_BLOCK_SIZING>>> = Vec::with_capacity(1);
     match *data_type {
-        DataType::Int8 => instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, Int8Type, data_type),
-        DataType::Int16 => instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, Int16Type, data_type),
-        DataType::Int32 => instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, Int32Type, data_type),
-        DataType::Int64 => instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, Int64Type, data_type),
-        DataType::UInt8 => instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, UInt8Type, data_type),
-        DataType::UInt16 => instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, UInt16Type, data_type),
-        DataType::UInt32 => instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, UInt32Type, data_type),
-        DataType::UInt64 => instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, UInt64Type, data_type),
+        DataType::Int8 => instantiate_primitive!(
+            FIXED_BLOCK_SIZING,
+            block_size,
+            v,
+            nullable,
+            Int8Type,
+            data_type
+        ),
+        DataType::Int16 => instantiate_primitive!(
+            FIXED_BLOCK_SIZING,
+            block_size,
+            v,
+            nullable,
+            Int16Type,
+            data_type
+        ),
+        DataType::Int32 => instantiate_primitive!(
+            FIXED_BLOCK_SIZING,
+            block_size,
+            v,
+            nullable,
+            Int32Type,
+            data_type
+        ),
+        DataType::Int64 => instantiate_primitive!(
+            FIXED_BLOCK_SIZING,
+            block_size,
+            v,
+            nullable,
+            Int64Type,
+            data_type
+        ),
+        DataType::UInt8 => instantiate_primitive!(
+            FIXED_BLOCK_SIZING,
+            block_size,
+            v,
+            nullable,
+            UInt8Type,
+            data_type
+        ),
+        DataType::UInt16 => instantiate_primitive!(
+            FIXED_BLOCK_SIZING,
+            block_size,
+            v,
+            nullable,
+            UInt16Type,
+            data_type
+        ),
+        DataType::UInt32 => instantiate_primitive!(
+            FIXED_BLOCK_SIZING,
+            block_size,
+            v,
+            nullable,
+            UInt32Type,
+            data_type
+        ),
+        DataType::UInt64 => instantiate_primitive!(
+            FIXED_BLOCK_SIZING,
+            block_size,
+            v,
+            nullable,
+            UInt64Type,
+            data_type
+        ),
         DataType::Float32 => {
-            instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, Float32Type, data_type)
+            instantiate_primitive!(
+                FIXED_BLOCK_SIZING,
+                block_size,
+                v,
+                nullable,
+                Float32Type,
+                data_type
+            )
         }
         DataType::Float64 => {
-            instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, Float64Type, data_type)
+            instantiate_primitive!(
+                FIXED_BLOCK_SIZING,
+                block_size,
+                v,
+                nullable,
+                Float64Type,
+                data_type
+            )
         }
-        DataType::Date32 => instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, Date32Type, data_type),
-        DataType::Date64 => instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, Date64Type, data_type),
+        DataType::Date32 => instantiate_primitive!(
+            FIXED_BLOCK_SIZING,
+            block_size,
+            v,
+            nullable,
+            Date32Type,
+            data_type
+        ),
+        DataType::Date64 => instantiate_primitive!(
+            FIXED_BLOCK_SIZING,
+            block_size,
+            v,
+            nullable,
+            Date64Type,
+            data_type
+        ),
         DataType::Time32(t) => match t {
             TimeUnit::Second => {
-                instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, Time32SecondType, data_type)
+                instantiate_primitive!(
+                    FIXED_BLOCK_SIZING,
+                    block_size,
+                    v,
+                    nullable,
+                    Time32SecondType,
+                    data_type
+                )
             }
             TimeUnit::Millisecond => {
-                instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, Time32MillisecondType, data_type)
+                instantiate_primitive!(
+                    FIXED_BLOCK_SIZING,
+                    block_size,
+                    v,
+                    nullable,
+                    Time32MillisecondType,
+                    data_type
+                )
             }
             // Time32 with Microsecond / Nanosecond is not a valid Arrow type
             // combination; reject explicitly so group_column_supported_type
@@ -1081,10 +1199,24 @@ fn make_group_column<const FIXED_BLOCK_SIZING: bool>(
         },
         DataType::Time64(t) => match t {
             TimeUnit::Microsecond => {
-                instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, Time64MicrosecondType, data_type)
+                instantiate_primitive!(
+                    FIXED_BLOCK_SIZING,
+                    block_size,
+                    v,
+                    nullable,
+                    Time64MicrosecondType,
+                    data_type
+                )
             }
             TimeUnit::Nanosecond => {
-                instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, Time64NanosecondType, data_type)
+                instantiate_primitive!(
+                    FIXED_BLOCK_SIZING,
+                    block_size,
+                    v,
+                    nullable,
+                    Time64NanosecondType,
+                    data_type
+                )
             }
             // Time64 with Second / Millisecond is not a valid Arrow type
             // combination; reject explicitly.
@@ -1092,69 +1224,134 @@ fn make_group_column<const FIXED_BLOCK_SIZING: bool>(
         },
         DataType::Timestamp(t, _) => match t {
             TimeUnit::Second => {
-                instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, TimestampSecondType, data_type)
+                instantiate_primitive!(
+                    FIXED_BLOCK_SIZING,
+                    block_size,
+                    v,
+                    nullable,
+                    TimestampSecondType,
+                    data_type
+                )
             }
             TimeUnit::Millisecond => {
-                instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, TimestampMillisecondType, data_type)
+                instantiate_primitive!(
+                    FIXED_BLOCK_SIZING,
+                    block_size,
+                    v,
+                    nullable,
+                    TimestampMillisecondType,
+                    data_type
+                )
             }
             TimeUnit::Microsecond => {
-                instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, TimestampMicrosecondType, data_type)
+                instantiate_primitive!(
+                    FIXED_BLOCK_SIZING,
+                    block_size,
+                    v,
+                    nullable,
+                    TimestampMicrosecondType,
+                    data_type
+                )
             }
             TimeUnit::Nanosecond => {
-                instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, TimestampNanosecondType, data_type)
+                instantiate_primitive!(
+                    FIXED_BLOCK_SIZING,
+                    block_size,
+                    v,
+                    nullable,
+                    TimestampNanosecondType,
+                    data_type
+                )
             }
         },
         DataType::Decimal128(_, _) => {
-            instantiate_primitive!(FIXED_BLOCK_SIZING, block_size, v, nullable, Decimal128Type, data_type)
+            instantiate_primitive!(
+                FIXED_BLOCK_SIZING,
+                block_size,
+                v,
+                nullable,
+                Decimal128Type,
+                data_type
+            )
         }
         DataType::Utf8 => {
-            v.push(Box::new(ByteGroupValueBuilder::<FIXED_BLOCK_SIZING, i32>::new(
-                OutputType::Utf8,
-                block_size,
-            )));
+            v.push(Box::new(
+                ByteGroupValueBuilder::<FIXED_BLOCK_SIZING, i32>::new(
+                    OutputType::Utf8,
+                    block_size,
+                ),
+            ));
         }
         DataType::LargeUtf8 => {
-            v.push(Box::new(ByteGroupValueBuilder::<FIXED_BLOCK_SIZING, i64>::new(
-                OutputType::Utf8,
-                block_size,
-            )));
+            v.push(Box::new(
+                ByteGroupValueBuilder::<FIXED_BLOCK_SIZING, i64>::new(
+                    OutputType::Utf8,
+                    block_size,
+                ),
+            ));
         }
         DataType::Binary => {
-            v.push(Box::new(ByteGroupValueBuilder::<FIXED_BLOCK_SIZING, i32>::new(
-                OutputType::Binary,
-                block_size,
-            )));
+            v.push(Box::new(
+                ByteGroupValueBuilder::<FIXED_BLOCK_SIZING, i32>::new(
+                    OutputType::Binary,
+                    block_size,
+                ),
+            ));
         }
         DataType::LargeBinary => {
-            v.push(Box::new(ByteGroupValueBuilder::<FIXED_BLOCK_SIZING, i64>::new(
-                OutputType::Binary,
-                block_size,
-            )));
+            v.push(Box::new(
+                ByteGroupValueBuilder::<FIXED_BLOCK_SIZING, i64>::new(
+                    OutputType::Binary,
+                    block_size,
+                ),
+            ));
         }
         // // A negative width is not a valid Arrow type; it falls to the `_`
         // // arm below, matching `group_column_supported_type`.
         // DataType::FixedSizeBinary(byte_width @ 0..) => {
         //     v.push(Box::new(FixedSizeBinaryGroupValueBuilder::new(byte_width)));
         // }
-
         DataType::Utf8View => {
-            v.push(Box::new(ByteViewGroupValueBuilder::<FIXED_BLOCK_SIZING, StringViewType>::new(block_size, None)));
+            v.push(Box::new(ByteViewGroupValueBuilder::<
+                FIXED_BLOCK_SIZING,
+                StringViewType,
+            >::new(block_size, None)));
         }
         DataType::BinaryView => {
-            v.push(Box::new(ByteViewGroupValueBuilder::<FIXED_BLOCK_SIZING, BinaryViewType>::new(block_size, None)));
+            v.push(Box::new(ByteViewGroupValueBuilder::<
+                FIXED_BLOCK_SIZING,
+                BinaryViewType,
+            >::new(block_size, None)));
         }
         DataType::Boolean => {
             if nullable {
-                v.push(Box::new(BooleanGroupValueBuilder::<FIXED_BLOCK_SIZING, true>::new(block_size)));
+                v.push(Box::new(
+                    BooleanGroupValueBuilder::<FIXED_BLOCK_SIZING, true>::new(block_size),
+                ));
             } else {
-                v.push(Box::new(BooleanGroupValueBuilder::<FIXED_BLOCK_SIZING, false>::new(block_size)));
+                v.push(Box::new(BooleanGroupValueBuilder::<
+                    FIXED_BLOCK_SIZING,
+                    false,
+                >::new(block_size)));
             }
         }
         DataType::List(f) => {
-            v.push(Box::new(ListGroupValueBuilder::<FIXED_BLOCK_SIZING, i32>::new(f.clone(), block_size, make_group_column::<false>(field, block_size)?)));
+            v.push(Box::new(
+                ListGroupValueBuilder::<FIXED_BLOCK_SIZING, i32>::new(
+                    f.clone(),
+                    block_size,
+                    make_group_column::<false>(field, block_size)?,
+                ),
+            ));
         }
         DataType::LargeList(f) => {
-            v.push(Box::new(ListGroupValueBuilder::<FIXED_BLOCK_SIZING, i64>::new(f.clone(), block_size, make_group_column::<false>(field, block_size)?)));
+            v.push(Box::new(
+                ListGroupValueBuilder::<FIXED_BLOCK_SIZING, i64>::new(
+                    f.clone(),
+                    block_size,
+                    make_group_column::<false>(field, block_size)?,
+                ),
+            ));
         }
         // DataType::Dictionary(ref key_dt, ref value_dt) => {
         //     let new_field = Field::new("", *value_dt.clone(), true);
@@ -1189,8 +1386,13 @@ fn make_group_column<const FIXED_BLOCK_SIZING: bool>(
         // can be encoded by arrow's row format. This is what lets a mixed
         // schema keep the column-wise fast path for its native columns instead
         // of dropping the whole key onto `GroupValuesRows`.
-        dt if dt.is_nested() && RowsGroupColumn::<FIXED_BLOCK_SIZING>::supports_type(&dt) => {
-            v.push(Box::new(RowsGroupColumn::<FIXED_BLOCK_SIZING>::try_new(dt.clone(), block_size)?));
+        dt if dt.is_nested()
+            && RowsGroupColumn::<FIXED_BLOCK_SIZING>::supports_type(&dt) =>
+        {
+            v.push(Box::new(RowsGroupColumn::<FIXED_BLOCK_SIZING>::try_new(
+                dt.clone(),
+                block_size,
+            )?));
         }
         _ => return not_impl_err!("{data_type} not supported in GroupValuesColumn"),
     }
@@ -1231,9 +1433,9 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         self.group_values[0].len()
     }
 
-    fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+    fn emit(&mut self, emit_to: BlockedEmitTo) -> Result<Vec<Vec<ArrayRef>>> {
         let mut output = match emit_to {
-            EmitTo::All => {
+            BlockedEmitTo::All => {
                 // Replace the column builders with a fresh set so the
                 // aggregator is immediately reusable after the drain.
                 // Same `self.schema` was already validated by `try_new`,
@@ -1248,95 +1450,59 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                     .map(|v| v.build())
                     .collect::<Vec<_>>()
             }
-            EmitTo::First(n) => {
+            BlockedEmitTo::First(n) => {
                 let output = self
                     .group_values
                     .iter_mut()
-                    .map(|v| v.take_n(n))
+                    .map(|v| v.take_n(n, None))
                     .collect::<Vec<_>>();
-                let mut next_new_list_offset = 0;
 
-                self.map.retain(|(_exist_hash, group_idx_view)| {
-                    // In non-streaming case, we need to check if the `group index view`
-                    // is `inlined` or `non-inlined`
-                    if !STREAMING && group_idx_view.is_non_inlined() {
-                        // Non-inlined case
-                        // We take `group_index_list` from `old_group_index_lists`
+                self.clear_after_emit_n(BlocksIndex::from_index_in_fixed_block_size(
+                    n,
+                    self.block_size,
+                ));
 
-                        // list_offset is incrementally
-                        self.emit_group_index_list_buffer.clear();
-                        let list_offset = group_idx_view.value() as usize;
-                        for group_index in self.group_index_lists[list_offset].iter() {
-                            if let Some(remaining) = group_index.checked_sub(n) {
-                                self.emit_group_index_list_buffer.push(remaining);
-                            }
-                        }
-
-                        // The possible results:
-                        //   - `new_group_index_list` is empty, we should erase this bucket
-                        //   - only one value in `new_group_index_list`, switch the `view` to `inlined`
-                        //   - still multiple values in `new_group_index_list`, build and set the new `unlined view`
-                        if self.emit_group_index_list_buffer.is_empty() {
-                            false
-                        } else if self.emit_group_index_list_buffer.len() == 1 {
-                            let group_index =
-                                self.emit_group_index_list_buffer.first().unwrap();
-                            *group_idx_view =
-                                GroupIndexView::new_inlined(*group_index as u64);
-                            true
-                        } else {
-                            let group_index_list =
-                                &mut self.group_index_lists[next_new_list_offset];
-                            group_index_list.clear();
-                            group_index_list
-                                .extend(self.emit_group_index_list_buffer.iter());
-                            *group_idx_view = GroupIndexView::new_non_inlined(
-                                next_new_list_offset as u64,
-                            );
-                            next_new_list_offset += 1;
-                            true
-                        }
-                    } else {
-                        // In `streaming case`, the `group index view` is ensured to be `inlined`
-                        debug_assert!(!group_idx_view.is_non_inlined());
-
-                        // Inlined case, we just decrement group index by n)
-                        let group_index = group_idx_view.value() as usize;
-                        match group_index.checked_sub(n) {
-                            // Group index was >= n, shift value down
-                            Some(sub) => {
-                                *group_idx_view = GroupIndexView::new_inlined(sub as u64);
-                                true
-                            }
-                            // Group index was < n, so remove from table
-                            None => false,
-                        }
-                    }
-                });
-
-                if !STREAMING {
-                    self.group_index_lists.truncate(next_new_list_offset);
-                }
+                vec![output]
+            }
+            BlockedEmitTo::NextBlock => {
+                let output = self
+                    .group_values
+                    .iter_mut()
+                    .map(|v| v.take_block())
+                    .collect::<Vec<_>>();
 
                 output
+                    .iter()
+                    .for_each(|o| assert_eq!(o.is_some(), output[0].is_some()));
+
+                self.clear_after_emit_n(BlocksIndex::new(1, 0));
+
+                let output = output.into_iter().map(|o| o.unwrap()).collect::<Vec<_>>();
+
+                vec![output]
             }
         };
 
-        // TODO: Materialize dictionaries in group keys (#7647)
-        for (field, array) in self.schema.fields.iter().zip(&mut output) {
-            let expected = field.data_type();
-            if let DataType::Dictionary(_, v) = expected {
-                let actual = array.data_type();
-                if v.as_ref() != actual {
-                    return Err(internal_datafusion_err!(
+        output
+          .into_iter()
+          .map(|mut output_block| {
+            // TODO: Materialize dictionaries in group keys (#7647)
+            for (field, array) in self.schema.fields.iter().zip(&mut output_block) {
+                let expected = field.data_type();
+                if let DataType::Dictionary(_, v) = expected {
+                    let actual = array.data_type();
+                    if v.as_ref() != actual {
+                        return Err(internal_datafusion_err!(
                         "Converted group rows expected dictionary of {v} got {actual}"
                     ));
+                    }
+                    *array = cast(array.as_ref(), expected)?;
                 }
-                *array = cast(array.as_ref(), expected)?;
             }
-        }
 
-        Ok(output)
+            Ok(output_block)
+        })
+          .collect::<Result<Vec<_>>>()
     }
 
     fn clear_shrink(&mut self, num_rows: usize) {
@@ -1357,6 +1523,70 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
             self.group_index_lists.clear();
             self.emit_group_index_list_buffer.clear();
             self.vectorized_operation_buffers.clear();
+        }
+    }
+}
+
+impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
+    fn clear_after_emit_n(&mut self, n: BlocksIndex) {
+        let mut next_new_list_offset = 0;
+
+        self.map.retain(|(_exist_hash, group_idx_view)| {
+            // In non-streaming case, we need to check if the `group index view`
+            // is `inlined` or `non-inlined`
+            if !STREAMING && group_idx_view.is_non_inlined() {
+                // Non-inlined case
+                // We take `group_index_list` from `old_group_index_lists`
+
+                // list_offset is incrementally
+                self.emit_group_index_list_buffer.clear();
+                let list_offset = group_idx_view.value() as usize;
+                for group_index in self.group_index_lists[list_offset].iter() {
+                    if let Some(remaining) = group_index.checked_sub(n) {
+                        self.emit_group_index_list_buffer.push(remaining);
+                    }
+                }
+
+                // The possible results:
+                //   - `new_group_index_list` is empty, we should erase this bucket
+                //   - only one value in `new_group_index_list`, switch the `view` to `inlined`
+                //   - still multiple values in `new_group_index_list`, build and set the new `unlined view`
+                if self.emit_group_index_list_buffer.is_empty() {
+                    false
+                } else if self.emit_group_index_list_buffer.len() == 1 {
+                    let group_index = self.emit_group_index_list_buffer.first().unwrap();
+                    *group_idx_view = GroupIndexView::new_inlined(*group_index as u64);
+                    true
+                } else {
+                    let group_index_list =
+                        &mut self.group_index_lists[next_new_list_offset];
+                    group_index_list.clear();
+                    group_index_list.extend(self.emit_group_index_list_buffer.iter());
+                    *group_idx_view =
+                        GroupIndexView::new_non_inlined(next_new_list_offset as u64);
+                    next_new_list_offset += 1;
+                    true
+                }
+            } else {
+                // In `streaming case`, the `group index view` is ensured to be `inlined`
+                debug_assert!(!group_idx_view.is_non_inlined());
+
+                // Inlined case, we just decrement group index by n)
+                let group_index = group_idx_view.value() as usize;
+                match group_index.checked_sub(n) {
+                    // Group index was >= n, shift value down
+                    Some(sub) => {
+                        *group_idx_view = GroupIndexView::new_inlined(sub as u64);
+                        true
+                    }
+                    // Group index was < n, so remove from table
+                    None => false,
+                }
+            }
+        });
+
+        if !STREAMING {
+            self.group_index_lists.truncate(next_new_list_offset);
         }
     }
 }
