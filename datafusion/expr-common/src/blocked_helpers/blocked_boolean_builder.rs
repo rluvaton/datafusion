@@ -185,6 +185,21 @@ impl<const FIXED_BLOCK_SIZING: bool> BlockedBooleanBuilder<FIXED_BLOCK_SIZING> {
         Some(block.build())
     }
 
+    pub fn take_all(&mut self) -> Vec<BooleanBuffer> {
+        let blocks = std::mem::take(&mut self.blocks);
+        assert_ne!(blocks.len(), 0);
+
+        assert_eq!(self.current_block_index, blocks.len() - 1);
+
+        // TODO - should preallocate? can be expensive for large schema
+        self.blocks.push_back(BooleanBufferBuilder::new(self.block_size));
+        self.len = 0;
+        self.current_block_index = 0;
+        self.finished_blocks_allocated_size = 0;
+
+        self.blocks.into_iter().map(|b| b.build()).collect()
+    }
+
     fn new_empty_buffer() -> BooleanBuffer {
         let empty_array = new_empty_array(&DataType::Boolean);
 
