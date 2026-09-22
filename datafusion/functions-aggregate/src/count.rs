@@ -34,14 +34,8 @@ use datafusion_common::{
     HashMap, Result, ScalarValue, downcast_value, exec_err, internal_err, not_impl_err,
     stats::Precision, utils::expr::COUNT_STAR_EXPANSION,
 };
-use datafusion_expr::{
-    Accumulator, AggregateUDFImpl, Documentation, EmitTo, Expr, GroupSelection,
-    GroupsAccumulator, ReversedUDAF, SetMonotonicity, Signature, StatisticsArgs,
-    TypeSignature, Volatility, WindowFunctionDefinition,
-    expr::WindowFunction,
-    function::{AccumulatorArgs, StateFieldsArgs},
-    utils::{AggregateOrderSensitivity, format_state_name},
-};
+use datafusion_expr::{expr::WindowFunction, function::{AccumulatorArgs, StateFieldsArgs}, utils::{AggregateOrderSensitivity, format_state_name}, Accumulator, AggregateUDFImpl, Documentation, EmitTo, Expr, GroupSelection, GroupsAccumulator, OrderedGroupsAccumulator, ReversedUDAF, SetMonotonicity, Signature, StatisticsArgs, TypeSignature, Volatility, WindowFunctionDefinition, GroupsInfo};
+use datafusion_expr::ordered_groups_accumulator::{PartitionRange, ProcessGroups};
 use datafusion_functions_aggregate_common::aggregate::count_distinct::PrimitiveDistinctCountGroupsAccumulator;
 use datafusion_functions_aggregate_common::aggregate::{
     count_distinct::Bitmap65536DistinctCountAccumulator,
@@ -65,6 +59,7 @@ use std::{
     ops::BitAnd,
     sync::Arc,
 };
+use datafusion_functions_aggregate_common::aggregate::ordered_groups_accumulator::OrderedGroupsAccumulatorAdapter;
 
 make_udaf_expr_and_func!(
     Count,
@@ -821,6 +816,84 @@ impl GroupsAccumulator for CountGroupsAccumulator {
     }
     fn size(&self) -> usize {
         self.counts.heap_size(&mut DFHeapSizeCtx::default())
+    }
+}
+
+
+struct CountsOrderedGroupsAccumulator {
+    ready_counts: Vec<i64>,
+    current_count: i64,
+}
+
+impl OrderedGroupsAccumulator for CountsOrderedGroupsAccumulator {
+    fn update_batch(&mut self, input: &[ArrayRef], groups: &GroupsInfo, opt_filter: Option<&BooleanArray>) -> Result<()> {
+        // TODO - this is only if input is non null
+        assert_eq!(input.len(), 1, "single argument to update_batch");
+        let values = &input[0];
+        assert_eq!(values.logical_null_count(), 0, "nulls are not supported (need to implement to not count non nulls)");
+        assert!(opt_filter.is_none(), "filter is not supported");
+
+        struct CountProcessor;
+
+        impl ProcessGroups for CountProcessor {
+            type A = CountsOrderedGroupsAccumulator;
+
+            fn on_new_standalone_group(t: &mut Self::A, group: &PartitionRange) {
+                t.ready_counts.push(group.len() as i64);
+            }
+
+            fn flush_in_progress_group(t: &mut Self::A, opt_group: Option<&PartitionRange>) {
+                t.current_count += opt_group.map_or(0, |g| g.len() as i64);
+                t.ready_counts.push(t.current_count);
+                t.current_count = 0;
+            }
+
+            fn add_last_group(t: &mut Self::A, last_group: &PartitionRange) {
+                t.current_count += last_group.len() as i64;
+            }
+        }
+
+        groups.process::<CountProcessor>(input, opt_filter, self)?;
+
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, input: &[ArrayRef], groups: &GroupsInfo) -> Result<()> {
+        self.update_batch(input, groups, None)
+    }
+
+    fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        Ok(vec![self.evaluate(emit_to)?])
+    }
+
+    fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        match emit_to {
+            EmitTo::All => {
+                let mut counts = std::mem::take(&mut self.ready_counts);
+                counts.push(self.current_count);
+                self.current_count = 0;
+                Ok(Arc::new(Int64Array::from(counts)))
+            },
+            EmitTo::First(n) if n == self.ready_counts.len() => {
+                let counts = std::mem::take(&mut self.ready_counts);
+                Ok(Arc::new(Int64Array::from(counts)))
+            },
+            EmitTo::First(n) if n == self.ready_counts.len() + 1 => {
+                let mut counts = std::mem::take(&mut self.ready_counts);
+                counts.push(self.current_count);
+                self.current_count = 0;
+                Ok(Arc::new(Int64Array::from(counts)))
+            }
+            EmitTo::First(_) => {
+                let counts = emit_to.take_needed(&mut self.ready_counts);
+
+                Ok(Arc::new(Int64Array::from(counts)))
+            },
+        }
+    }
+
+    fn size(&self) -> usize {
+        self.ready_counts.capacity() * size_of::<i64>()
     }
 }
 

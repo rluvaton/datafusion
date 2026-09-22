@@ -60,6 +60,10 @@ pub mod select_expr;
 pub mod groups_accumulator {
     pub use datafusion_expr_common::groups_accumulator::*;
 }
+pub mod ordered_groups_accumulator {
+    pub use datafusion_expr_common::ordered_groups_accumulator::*;
+}
+
 pub mod interval_arithmetic {
     pub use datafusion_expr_common::interval_arithmetic::*;
 }
@@ -105,6 +109,9 @@ pub use datafusion_expr_common::accumulator::Accumulator;
 pub use datafusion_expr_common::columnar_value::ColumnarValue;
 pub use datafusion_expr_common::groups_accumulator::{
     EmitTo, GroupSelection, GroupsAccumulator,
+};
+pub use datafusion_expr_common::ordered_groups_accumulator::{
+    GroupsInfo, OrderedGroupsAccumulator,
 };
 pub use datafusion_expr_common::operator::Operator;
 pub use datafusion_expr_common::placement::ExpressionPlacement;

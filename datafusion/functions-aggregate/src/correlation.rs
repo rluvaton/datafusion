@@ -31,7 +31,7 @@ use arrow::{
     array::ArrayRef,
     datatypes::{DataType, Field},
 };
-use datafusion_expr::{EmitTo, GroupSelection, GroupsAccumulator};
+use datafusion_expr::{EmitTo, GroupSelection, GroupsAccumulator, GroupsInfo, OrderedGroupsAccumulator};
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::accumulate::accumulate_multiple;
 use log::debug;
 
@@ -43,6 +43,7 @@ use datafusion_expr::{
     function::{AccumulatorArgs, StateFieldsArgs},
     utils::format_state_name,
 };
+use datafusion_expr::ordered_groups_accumulator::{PartitionRange, ProcessGroups};
 use datafusion_functions_aggregate_common::stats::StatsType;
 use datafusion_macros::user_doc;
 
@@ -358,6 +359,396 @@ impl CorrelationGroupsAccumulator {
     }
 }
 
+
+pub struct CorrelationOrderedGroupsAccumulator {
+    // Number of elements for each group
+    // This is also used to track nulls: if a group has 0 valid values accumulated,
+    // final aggregation result will be null.
+    count: Vec<u64>,
+    // Means and centered moments, in the same order as the scalar state.
+    mean_x: Vec<f64>,
+    m2_x: Vec<f64>,
+    mean_y: Vec<f64>,
+    m2_y: Vec<f64>,
+    co_moment: Vec<f64>,
+}
+
+impl CorrelationOrderedGroupsAccumulator {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    fn evaluate_values(
+        counts: &[u64],
+        mean_xs: &[f64],
+        m2_xs: &[f64],
+        mean_ys: &[f64],
+        m2_ys: &[f64],
+        co_moments: &[f64],
+    ) -> ArrayRef {
+        let n = counts.len();
+        let mut values = Vec::with_capacity(n);
+        let mut nulls = NullBufferBuilder::new(n);
+
+        for i in 0..n {
+            let count = counts[i];
+            let mean_x = mean_xs[i];
+            let mean_y = mean_ys[i];
+
+            // If both inputs are NaN, return NaN. If only one input is NaN,
+            // or there are too few values, return NULL.
+            if mean_x.is_nan() && mean_y.is_nan() {
+                values.push(f64::NAN);
+                nulls.append_non_null();
+                continue;
+            } else if count < 2 || mean_x.is_nan() || mean_y.is_nan() {
+                values.push(0.0);
+                nulls.append_null();
+                continue;
+            }
+
+            let count = count as f64;
+            let covariance = co_moments[i] / count;
+            let stddev_x = (m2_xs[i] / count).sqrt();
+            let stddev_y = (m2_ys[i] / count).sqrt();
+
+            if stddev_x == 0.0 || stddev_y == 0.0 {
+                values.push(0.0);
+                nulls.append_null();
+            } else {
+                values.push(covariance / stddev_x / stddev_y);
+                nulls.append_non_null();
+            }
+        }
+
+        Arc::new(Float64Array::new(values.into(), nulls.finish()))
+    }
+}
+
+/// GroupsAccumulator implementation for `corr(x, y)` that computes the Pearson correlation coefficient
+/// between two numeric columns.
+///
+/// Uses paired Welford updates and merges centered moments to avoid cancellation
+/// when input values have large offsets. Its state matches `CorrelationAccumulator`.
+impl OrderedGroupsAccumulator for CorrelationOrderedGroupsAccumulator {
+    fn update_batch(
+        &mut self,
+        values: &[ArrayRef],
+        groups: &GroupsInfo,
+        opt_filter: Option<&BooleanArray>,
+    ) -> Result<()> {
+        self.count.resize(total_num_groups, 0);
+        self.mean_x.resize(total_num_groups, 0.0);
+        self.m2_x.resize(total_num_groups, 0.0);
+        self.mean_y.resize(total_num_groups, 0.0);
+        self.m2_y.resize(total_num_groups, 0.0);
+        self.co_moment.resize(total_num_groups, 0.0);
+
+        let array_x = downcast_array::<Float64Array>(&values[0]);
+        let array_y = downcast_array::<Float64Array>(&values[1]);
+
+        struct Processor;
+
+        impl ProcessGroups for Processor {
+            type A = CorrelationOrderedGroupsAccumulator;
+
+            fn on_new_standalone_group(t: &mut Self::A, group: &PartitionRange) {
+                let x = columns[0].value(batch_index);
+                let y = columns[1].value(batch_index);
+                let mut count = 0_f64;
+                let mut delta_x = 0;
+                let mut delta_y = 0;
+                let mut mean_x = 0;
+                let mut mean_y = 0;
+                let mut m2_x = 0;
+                let mut m2_y = 0;
+                let mut co_moment = 0;
+
+                for index in group.start..group.end {
+                    let x = columns[0].value(index);
+                    let y = columns[1].value(index);
+                    count += 1;
+                    let delta_x = x - mean_x;
+                    let delta_y = y - mean_y;
+                    mean_x += delta_x / count;
+                    mean_y += delta_y / count;
+                    m2_x += delta_x * (x - mean_x);
+                    m2_y += delta_y * (y - mean_y);
+                    co_moment += delta_x * (y - mean_y);
+                }
+
+                if t.into_evaluate {
+                    t.ready.push(calcualte_output())
+                }
+                todo!()
+            }
+
+            fn on_new_single_item_group(t: &mut Self::A, group: usize) {
+                let x = columns[0].value(group);
+                let y = columns[1].value(group);
+                let count = 1;
+                let delta_x = x;
+                let delta_y = y;
+                let mean_x = x;
+                let mean_y = y;
+                let m2_x = 0;
+                let m2_y = 0;
+                let co_moment = 0;
+
+                // If both inputs are NaN, return NaN. If only one input is NaN,
+                // or there are too few values, return NULL.
+                if mean_x.is_nan() && mean_y.is_nan() {
+                    values.push(f64::NAN);
+                    nulls.append_non_null();
+                    continue;
+                } else if count < 2 || mean_x.is_nan() || mean_y.is_nan() {
+                    values.push(0.0);
+                    nulls.append_null();
+                    continue;
+                }
+
+                let count = count as f64;
+                let covariance = co_moments[i] / count;
+                let stddev_x = (m2_xs[i] / count).sqrt();
+                let stddev_y = (m2_ys[i] / count).sqrt();
+
+                if stddev_x == 0.0 || stddev_y == 0.0 {
+                    values.push(0.0);
+                    nulls.append_null();
+                } else {
+                    values.push(covariance / stddev_x / stddev_y);
+                    nulls.append_non_null();
+                }
+            }
+
+            fn flush_in_progress_group(t: &mut Self::A, opt_group: Option<&PartitionRange>) {
+                todo!()
+            }
+
+            fn add_last_group(t: &mut Self::A, last_group: &PartitionRange) {
+                todo!()
+            }
+        }
+
+        groups.process::<Processor>(
+            values,
+            opt_filter,
+            self
+        )?;
+
+        accumulate_multiple(
+            groups,
+            &[&array_x, &array_y],
+            opt_filter,
+            |group_index, batch_index, columns| {
+                let x = columns[0].value(batch_index);
+                let y = columns[1].value(batch_index);
+                self.count[group_index] += 1;
+                let count = self.count[group_index] as f64;
+                let delta_x = x - self.mean_x[group_index];
+                let delta_y = y - self.mean_y[group_index];
+                self.mean_x[group_index] += delta_x / count;
+                self.mean_y[group_index] += delta_y / count;
+                self.m2_x[group_index] += delta_x * (x - self.mean_x[group_index]);
+                self.m2_y[group_index] += delta_y * (y - self.mean_y[group_index]);
+                self.co_moment[group_index] += delta_x * (y - self.mean_y[group_index]);
+            },
+        );
+
+        Ok(())
+    }
+
+    fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        Ok(Self::evaluate_values(
+            &emit_to.take_needed(&mut self.count),
+            &emit_to.take_needed(&mut self.mean_x),
+            &emit_to.take_needed(&mut self.m2_x),
+            &emit_to.take_needed(&mut self.mean_y),
+            &emit_to.take_needed(&mut self.m2_y),
+            &emit_to.take_needed(&mut self.co_moment),
+        ))
+    }
+
+    fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        selection.validate_num_groups(self.count.len())?;
+        Ok(Self::evaluate_values(
+            &copy_selected(selection, &self.count),
+            &copy_selected(selection, &self.mean_x),
+            &copy_selected(selection, &self.m2_x),
+            &copy_selected(selection, &self.mean_y),
+            &copy_selected(selection, &self.m2_y),
+            &copy_selected(selection, &self.co_moment),
+        ))
+    }
+
+    fn supports_evaluate_preserving(&self) -> bool {
+        true
+    }
+
+    fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        // Drain the state vectors for the groups being emitted
+        let count = emit_to.take_needed(&mut self.count);
+        let mean_x = emit_to.take_needed(&mut self.mean_x);
+        let m2_x = emit_to.take_needed(&mut self.m2_x);
+        let mean_y = emit_to.take_needed(&mut self.mean_y);
+        let m2_y = emit_to.take_needed(&mut self.m2_y);
+        let co_moment = emit_to.take_needed(&mut self.co_moment);
+
+        Ok(vec![
+            Arc::new(UInt64Array::from(count)),
+            Arc::new(Float64Array::from(mean_x)),
+            Arc::new(Float64Array::from(m2_x)),
+            Arc::new(Float64Array::from(mean_y)),
+            Arc::new(Float64Array::from(m2_y)),
+            Arc::new(Float64Array::from(co_moment)),
+        ])
+    }
+
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        opt_filter: Option<&BooleanArray>,
+    ) -> Result<Vec<ArrayRef>> {
+        assert_eq!(values.len(), 2, "two arguments to convert_to_state");
+        let array_x = downcast_array::<Float64Array>(&values[0]);
+        let array_y = downcast_array::<Float64Array>(&values[1]);
+
+        let len = array_x.len();
+        let mut counts = Vec::with_capacity(len);
+        let mut mean_x = Vec::with_capacity(len);
+        let mut m2_x = Vec::with_capacity(len);
+        let mut mean_y = Vec::with_capacity(len);
+        let mut m2_y = Vec::with_capacity(len);
+        let mut co_moment = Vec::with_capacity(len);
+
+        for row in 0..len {
+            let included = array_x.is_valid(row)
+              && array_y.is_valid(row)
+              && opt_filter
+              .is_none_or(|filter| filter.is_valid(row) && filter.value(row));
+            if included {
+                let x = array_x.value(row);
+                let y = array_y.value(row);
+                counts.push(1);
+                mean_x.push(x);
+                mean_y.push(y);
+            } else {
+                counts.push(0);
+                mean_x.push(0.0);
+                mean_y.push(0.0);
+            }
+            m2_x.push(0.0);
+            m2_y.push(0.0);
+            co_moment.push(0.0);
+        }
+
+        Ok(vec![
+            Arc::new(UInt64Array::from(counts)),
+            Arc::new(Float64Array::from(mean_x)),
+            Arc::new(Float64Array::from(m2_x)),
+            Arc::new(Float64Array::from(mean_y)),
+            Arc::new(Float64Array::from(m2_y)),
+            Arc::new(Float64Array::from(co_moment)),
+        ])
+    }
+    fn state_preserving(
+        &mut self,
+        selection: GroupSelection<'_>,
+    ) -> Result<Vec<ArrayRef>> {
+        selection.validate_num_groups(self.count.len())?;
+        Ok(vec![
+            Arc::new(UInt64Array::from(copy_selected(selection, &self.count))),
+            Arc::new(Float64Array::from(copy_selected(selection, &self.mean_x))),
+            Arc::new(Float64Array::from(copy_selected(selection, &self.m2_x))),
+            Arc::new(Float64Array::from(copy_selected(selection, &self.mean_y))),
+            Arc::new(Float64Array::from(copy_selected(selection, &self.m2_y))),
+            Arc::new(Float64Array::from(copy_selected(
+                selection,
+                &self.co_moment,
+            ))),
+        ])
+    }
+
+    fn supports_state_preserving(&self) -> bool {
+        true
+    }
+
+    fn merge_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        total_num_groups: usize,
+    ) -> Result<()> {
+        // Resize vectors to accommodate total number of groups
+        self.count.resize(total_num_groups, 0);
+        self.mean_x.resize(total_num_groups, 0.0);
+        self.m2_x.resize(total_num_groups, 0.0);
+        self.mean_y.resize(total_num_groups, 0.0);
+        self.m2_y.resize(total_num_groups, 0.0);
+        self.co_moment.resize(total_num_groups, 0.0);
+
+        // Extract arrays from input values
+        let partial_counts = values[0].as_primitive::<UInt64Type>();
+        let partial_mean_x = values[1].as_primitive::<Float64Type>();
+        let partial_m2_x = values[2].as_primitive::<Float64Type>();
+        let partial_mean_y = values[3].as_primitive::<Float64Type>();
+        let partial_m2_y = values[4].as_primitive::<Float64Type>();
+        let partial_co_moment = values[5].as_primitive::<Float64Type>();
+
+        accumulate_correlation_states(
+            group_indices,
+            (
+                partial_counts,
+                partial_mean_x,
+                partial_m2_x,
+                partial_mean_y,
+                partial_m2_y,
+                partial_co_moment,
+            ),
+            |group_index, count, values| {
+                if count == 0 {
+                    return;
+                }
+                let old_count = self.count[group_index];
+                if old_count == 0 {
+                    self.count[group_index] = count;
+                    self.mean_x[group_index] = values[0];
+                    self.m2_x[group_index] = values[1];
+                    self.mean_y[group_index] = values[2];
+                    self.m2_y[group_index] = values[3];
+                    self.co_moment[group_index] = values[4];
+                    return;
+                }
+
+                let new_count = old_count + count;
+                let delta_x = values[0] - self.mean_x[group_index];
+                let delta_y = values[2] - self.mean_y[group_index];
+                let weight = count as f64 / new_count as f64;
+                let correction = old_count as f64 * weight;
+                self.count[group_index] = new_count;
+                self.mean_x[group_index] += delta_x * weight;
+                self.mean_y[group_index] += delta_y * weight;
+                // Apply the weight before multiplying deltas to avoid overflow
+                // when the merged centered moment is still representable.
+                self.m2_x[group_index] += values[1] + delta_x * (delta_x * correction);
+                self.m2_y[group_index] += values[3] + delta_y * (delta_y * correction);
+                self.co_moment[group_index] +=
+                  values[4] + delta_x * (delta_y * correction);
+            },
+        );
+
+        Ok(())
+    }
+
+    fn size(&self) -> usize {
+        self.count.capacity() * size_of::<u64>()
+          + self.mean_x.capacity() * size_of::<f64>()
+          + self.m2_x.capacity() * size_of::<f64>()
+          + self.mean_y.capacity() * size_of::<f64>()
+          + self.m2_y.capacity() * size_of::<f64>()
+          + self.co_moment.capacity() * size_of::<f64>()
+    }
+}
 /// Specialized version of `accumulate_multiple` for correlation's merge_batch
 ///
 /// Note: Arrays in `state_arrays` should not have null values, because they are all

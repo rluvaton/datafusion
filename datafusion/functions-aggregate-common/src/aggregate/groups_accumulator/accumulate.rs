@@ -26,6 +26,7 @@ use arrow::datatypes::ArrowPrimitiveType;
 use crate::aggregate::groups_accumulator::nulls::filter_to_validity;
 use datafusion_common::Result;
 use datafusion_expr_common::groups_accumulator::{EmitTo, GroupSelection};
+use datafusion_expr_common::ordered_groups_accumulator::GroupsInfo;
 
 /// If the input has nulls, then the accumulator must potentially
 /// handle each input null value specially (e.g. for `SUM` to mark the
@@ -538,8 +539,8 @@ pub fn accumulate_multiple<T, F>(
     opt_filter: Option<&BooleanArray>,
     mut value_fn: F,
 ) where
-    T: ArrowPrimitiveType + Send,
-    F: FnMut(usize, usize, &[&PrimitiveArray<T>]) + Send,
+  T: ArrowPrimitiveType + Send,
+  F: FnMut(usize, usize, &[&PrimitiveArray<T>]) + Send,
 {
     for col in value_columns.iter() {
         debug_assert_eq!(col.len(), group_indices.len());
@@ -547,14 +548,79 @@ pub fn accumulate_multiple<T, F>(
 
     // Start with rows where all value columns are non-null.
     let mut valid_indices =
-        NullBuffer::union_many(value_columns.iter().map(|arr| arr.nulls()))
-            .map(NullBuffer::into_inner);
+      NullBuffer::union_many(value_columns.iter().map(|arr| arr.nulls()))
+        .map(NullBuffer::into_inner);
 
     // Restrict to rows where the optional filter is Some(true). Keep the filter
     // as a raw BooleanBuffer to avoid computing a NullBuffer null_count just to
     // test row validity below.
     if let Some(filter) = opt_filter {
         debug_assert_eq!(filter.len(), group_indices.len());
+        let filter_validity = filter_to_validity(filter);
+        if let Some(valid_indices) = valid_indices.as_mut() {
+            *valid_indices &= &filter_validity;
+        } else {
+            valid_indices = Some(filter_validity);
+        }
+    }
+
+    match valid_indices {
+        None => {
+            for (batch_idx, &group_idx) in group_indices.iter().enumerate() {
+                value_fn(group_idx, batch_idx, value_columns);
+            }
+        }
+        Some(valid_indices) => {
+            for (batch_idx, &group_idx) in group_indices.iter().enumerate() {
+                if valid_indices.value(batch_idx) {
+                    value_fn(group_idx, batch_idx, value_columns);
+                }
+            }
+        }
+    }
+}
+
+
+/// Accumulates with multiple accumulate(value) columns. (e.g. `corr(c1, c2)`)
+///
+/// This method assumes that for any input record index, if any of the value column
+/// is null, or it's filtered out by `opt_filter`, then the record would be ignored.
+/// (Won't be accumulated by `value_fn`)
+///
+/// # Arguments
+///
+/// * `group_indices` - To which groups do the rows in `value_columns` belong
+/// * `value_columns` - The input arrays to accumulate
+/// * `opt_filter` - Optional filter array. If present, only rows where filter is `Some(true)` are included
+/// * `value_fn` - Callback function for each valid row, with parameters:
+///     * `group_idx`: The group index for the current row
+///     * `batch_idx`: The index of the current row in the input arrays
+///     * `columns`: Reference to all input arrays for accessing values
+pub fn accumulate_multiple_ordered<T, F>(
+    groups: &GroupsInfo,
+    value_columns: &[&PrimitiveArray<T>],
+    opt_filter: Option<&BooleanArray>,
+    mut value_fn: F,
+) where
+  T: ArrowPrimitiveType + Send,
+  F: FnMut(usize, usize, &[&PrimitiveArray<T>]) + Send,
+{
+    for col in value_columns.iter() {
+        // TODO - total number of rows, not groups
+        debug_assert_eq!(col.len(), groups.total_number_of_groups());
+    }
+
+    // Start with rows where all value columns are non-null.
+    let mut valid_indices =
+      NullBuffer::union_many(value_columns.iter().map(|arr| arr.nulls()))
+        .map(NullBuffer::into_inner);
+
+    // Restrict to rows where the optional filter is Some(true). Keep the filter
+    // as a raw BooleanBuffer to avoid computing a NullBuffer null_count just to
+    // test row validity below.
+    if let Some(filter) = opt_filter {
+        // TODO - total number of rows, not groups
+        debug_assert_eq!(filter.len(), groups.total_number_of_groups());
         let filter_validity = filter_to_validity(filter);
         if let Some(valid_indices) = valid_indices.as_mut() {
             *valid_indices &= &filter_validity;

@@ -2,6 +2,29 @@ use std::fmt::Debug;
 use std::ops::Range;
 use arrow::array::{ArrayRef, BooleanArray};
 use datafusion_common::Result;
+use crate::groups_accumulator::EmitTo;
+
+pub trait ProcessGroups {
+  type A: OrderedGroupsAccumulator;
+
+  fn reserve_for_n_new_groups(t: &mut Self::A, n: usize) {
+    // default implementation does nothing, but can be overridden to reserve space for new groups
+  }
+
+  /// Called when a new group is found in the input and it is not the same as the previous group and it is contained in the current batch
+  fn on_new_standalone_group(t: &mut Self::A, group: &PartitionRange);
+
+  fn on_new_single_item_group(t: &mut Self::A, group: usize) {
+    Self::on_new_standalone_group(t, &PartitionRange { start: group, end: group + 1, is_same_as_before: false });
+  }
+
+  /// Finish the current group and flush it to the output, if any.
+  /// If `opt_group` is `Some`, add the opt group values to the in progress and flush it
+  fn flush_in_progress_group(t: &mut Self::A, opt_group: Option<&PartitionRange>);
+
+  /// Add the last group to the in progress group
+  fn add_last_group(t: &mut Self::A, last_group: &PartitionRange);
+}
 
 /// Hold a range for a partition in a batch (start..end) and whether this partition is the same as the previous one
 /// (e.g. between batches)
@@ -50,6 +73,7 @@ pub enum AllSingleItemType {
 
 #[derive(Debug, Clone)]
 pub struct GroupsInfo {
+  // TODO - THIS IS a problem with the Boolean since the range would not be continues
   groups: Vec<PartitionRange>,
   properties: GroupsProperties,
   total_number_of_groups: usize,
@@ -81,6 +105,55 @@ impl GroupsInfo {
     } else {
       &self.groups[1..self.groups.len() - 1]
     }
+  }
+
+  pub fn process<Processor: ProcessGroups>(&self, input: &[ArrayRef], opt_filter: Option<&BooleanArray>, groups_accu: &mut Processor::A) -> Result<()> {
+    // TODO - this is only if input is non null
+    assert_eq!(input.len(), 1, "single argument to update_batch");
+    let values = &input[0];
+    assert_eq!(values.logical_null_count(), 0, "nulls are not supported (need to implement to not count non nulls)");
+    assert!(opt_filter.is_none(), "filter is not supported");
+
+    let (groups_iter, last_group) = self.groups_without_last();
+    let mut groups_iter = groups_iter.iter();
+    let Some(group) = groups_iter.next() else {
+      let Some(last_group) = last_group else {
+        return Ok(());
+      };
+
+      if !last_group.is_same_as_before {
+        Processor::flush_in_progress_group(groups_accu, None);
+      }
+      Processor::add_last_group(groups_accu, last_group);
+
+      return Ok(())
+    };
+
+    // TODO - reserve needed groups
+
+    if !group.is_same_as_before {
+      Processor::flush_in_progress_group(groups_accu, None);
+      // // Flush prev group
+      // self.ready_counts.push(self.current_count);
+      // self.current_count = 0;
+    } else {
+      Processor::flush_in_progress_group(groups_accu, Some(group));
+    }
+    //
+    //
+    // // Add the first group
+    // self.ready_counts.push(self.current_count + group.len() as i64);
+    // self.current_count = 0;
+
+
+    for group in groups_iter {
+      Processor::on_new_standalone_group(groups_accu, group);
+    }
+
+
+    Processor::add_last_group(groups_accu, last_group.expect("must have last group if have groups before last"));
+
+    Ok(())
   }
 
   /// Return iterator of (group_index, row_index) for each row
@@ -147,9 +220,9 @@ pub trait OrderedGroupsAccumulator: Send + std::any::Any {
 
   fn merge_batch(&mut self, input: &[ArrayRef], groups: &GroupsInfo) -> Result<()>;
 
-  fn state(&mut self, take_in_progress: bool) -> Result<Vec<ArrayRef>>;
+  fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>>;
 
-  fn evaluate(&mut self, take_in_progress: bool) -> Result<ArrayRef>;
+  fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef>;
 
   //
   // /// num_rows in case the partition does not get any input
