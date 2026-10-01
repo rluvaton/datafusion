@@ -25,9 +25,7 @@ use arrow::compute;
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::datatypes::DataType;
 use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
-use datafusion_expr_common::ordered_groups_accumulator::{
-    AllSingleItemType, GroupsInfo, OrderedGroupsAccumulator,
-};
+use datafusion_expr_common::ordered_groups_accumulator::{AllSingleItemType, GroupsInfo, OrderedGroupsAccumulator, PartitionRange, ProcessGroups};
 
 /// An accumulator that implements a single operation over
 /// [`ArrowPrimitiveType`] where the accumulated state is the same as
@@ -202,100 +200,143 @@ where
 
         let values_as_slice = values.values().as_ref();
 
-        // update values
-        // self.ready_values.resize(groups.total_number_of_groups(), self.starting_value);
+        struct PrimOpProcessor;
 
-        // Optimization: if all the values are in the same group
-        if groups.is_single_group() {
-            // If we are starting a new group, save the previous group value and reset the in_progress value
-            if !groups.is_first_group_same_as_before() {
-                self.ready_values.push(self.in_progress);
-                self.in_progress = self.starting_value;
-            }
+        impl ProcessGroups for PrimOpProcessor {
+            type A = PrimitiveOrderedGroupsAccumulator<T, F>;
 
-            self.process_last_group(groups, values_as_slice);
-
-            return Ok(());
-        }
-
-        // Optimization: if all the values are in single item groups we can fast process them
-        if groups.are_all_single_item_ignoring_edges() {
-            // TODO - handle the case where group does not start from 0 and not ends at the last group? also can it have gaps?
-            assert_ne!(
-              groups.groups().len(),
-              1,
-              "must not have only one group and same as before here since dont want to push the in progress value yet"
-            );
-
-            self.update_batch_in_single_item(groups, values_as_slice)?;
-
-            return Ok(());
-        }
-
-        // If there are only 2 groups we can optimize by processing 2 slices separately
-        if groups.groups().len() == 2 {
-
-            // Save the last group if finished
-            if !groups.is_first_group_same_as_before() {
-                // if the first group is not the same as before, we want to save the as ready
-                // if the first group is the same as before, we want to to make it the base of the in progress value and not the starting value
-                self.ready_values.push(self.in_progress);
-
-                // Reset the in progress one
-                self.in_progress = self.starting_value;
-            }
-
-            // Process the first group
-            {
-                let first_group = &groups.groups()[0];
-
-                values_as_slice[first_group.start..first_group.end]
+            fn on_new_standalone_group(t: &mut Self::A, group: &PartitionRange) {
+                let mut value = t.starting_value;
+                self.values_as_slice[group.start..group.end]
                   .iter()
                   .for_each(|&new_value| {
-                      (self.prim_fn)(&mut self.in_progress, new_value);
+                      (t.prim_fn)(&mut value, new_value);
                   });
 
-                self.ready_values.push(self.in_progress);
-                // Reset the in progress for the next group
-                self.in_progress = self.starting_value;
+                t.ready_values.push(value);
+
+                // TODO - null state update?
             }
-            self.process_last_group(groups, values_as_slice);
 
-            return Ok(());
+            fn flush_in_progress_group(t: &mut Self::A, opt_group: Option<&PartitionRange>) {
+                if let Some(group) = opt_group {
+                    self.values_as_slice[group.start..group.end]
+                      .iter()
+                      .for_each(|&new_value| {
+                          (t.prim_fn)(&mut t.in_progress, new_value);
+                      });
+                }
+                t.ready_values.push(t.in_progress);
+                t.in_progress = t.starting_value;
+                // TODO - null state update?
+            }
+
+            fn add_last_group(t: &mut Self::A, last_group: &PartitionRange) {
+                self.values_as_slice[last_group.start..last_group.end]
+                  .iter()
+                  .for_each(|&new_value| {
+                      (t.prim_fn)(&mut t.in_progress, new_value);
+                  });
+                // TODO - null state update?
+            }
         }
 
-        // If starting a new group, save the previous group value and reset the in_progress value
-        if !groups.is_first_group_same_as_before() {
-            self.ready_values.push(self.in_progress);
-            self.in_progress = self.starting_value;
-        }
+        groups.process::<PrimOpProcessor>(values, opt_filter, self)?;
 
-        // Fallback implementation
-        // TODO - maybe have distribution in the groups property whether there are more
-
-        let prev_len = self.ready_values.len();
-        // - 1 for the last group to be in progress
-        self.ready_values.resize(prev_len + groups.groups().len() - 1, self.starting_value);
-
-        // If the first group is not a new group, change the starting value to be the in progress one
-        if groups.is_first_group_same_as_before() {
-            self.ready_values[prev_len] = self.in_progress;
-        };
-
-        groups.as_iter_of_group_indices_with_match(
-            values_as_slice,
-            // Don't include last group as we process it into the in progress value
-            false
-        ).for_each(|(group_index, new_value)| {
-            // TODO - can optimize to get the next mutable value as it is running instead of using get_unchecked
-            // SAFETY: group_index is guaranteed to be in bounds
-            let value = unsafe { self.ready_values.get_unchecked_mut(prev_len + group_index) };
-
-            (self.prim_fn)(value, new_value);
-        });
-
-
-        self.process_last_group(groups, values_as_slice);
+        // // update values
+        // // self.ready_values.resize(groups.total_number_of_groups(), self.starting_value);
+        //
+        // // Optimization: if all the values are in the same group
+        // if groups.is_single_group() {
+        //     // If we are starting a new group, save the previous group value and reset the in_progress value
+        //     if !groups.is_first_group_same_as_before() {
+        //         self.ready_values.push(self.in_progress);
+        //         self.in_progress = self.starting_value;
+        //     }
+        //
+        //     self.process_last_group(groups, values_as_slice);
+        //
+        //     return Ok(());
+        // }
+        //
+        // // Optimization: if all the values are in single item groups we can fast process them
+        // if groups.are_all_single_item_ignoring_edges() {
+        //     // TODO - handle the case where group does not start from 0 and not ends at the last group? also can it have gaps?
+        //     assert_ne!(
+        //       groups.groups().len(),
+        //       1,
+        //       "must not have only one group and same as before here since dont want to push the in progress value yet"
+        //     );
+        //
+        //     self.update_batch_in_single_item(groups, values_as_slice)?;
+        //
+        //     return Ok(());
+        // }
+        //
+        // // If there are only 2 groups we can optimize by processing 2 slices separately
+        // if groups.groups().len() == 2 {
+        //
+        //     // Save the last group if finished
+        //     if !groups.is_first_group_same_as_before() {
+        //         // if the first group is not the same as before, we want to save the as ready
+        //         // if the first group is the same as before, we want to to make it the base of the in progress value and not the starting value
+        //         self.ready_values.push(self.in_progress);
+        //
+        //         // Reset the in progress one
+        //         self.in_progress = self.starting_value;
+        //     }
+        //
+        //     // Process the first group
+        //     {
+        //         let first_group = &groups.groups()[0];
+        //
+        //         values_as_slice[first_group.start..first_group.end]
+        //           .iter()
+        //           .for_each(|&new_value| {
+        //               (self.prim_fn)(&mut self.in_progress, new_value);
+        //           });
+        //
+        //         self.ready_values.push(self.in_progress);
+        //         // Reset the in progress for the next group
+        //         self.in_progress = self.starting_value;
+        //     }
+        //     self.process_last_group(groups, values_as_slice);
+        //
+        //     return Ok(());
+        // }
+        //
+        // // If starting a new group, save the previous group value and reset the in_progress value
+        // if !groups.is_first_group_same_as_before() {
+        //     self.ready_values.push(self.in_progress);
+        //     self.in_progress = self.starting_value;
+        // }
+        //
+        // // Fallback implementation
+        // // TODO - maybe have distribution in the groups property whether there are more
+        //
+        // let prev_len = self.ready_values.len();
+        // // - 1 for the last group to be in progress
+        // self.ready_values.resize(prev_len + groups.groups().len() - 1, self.starting_value);
+        //
+        // // If the first group is not a new group, change the starting value to be the in progress one
+        // if groups.is_first_group_same_as_before() {
+        //     self.ready_values[prev_len] = self.in_progress;
+        // };
+        //
+        // groups.as_iter_of_group_indices_with_match(
+        //     values_as_slice,
+        //     // Don't include last group as we process it into the in progress value
+        //     false
+        // ).for_each(|(group_index, new_value)| {
+        //     // TODO - can optimize to get the next mutable value as it is running instead of using get_unchecked
+        //     // SAFETY: group_index is guaranteed to be in bounds
+        //     let value = unsafe { self.ready_values.get_unchecked_mut(prev_len + group_index) };
+        //
+        //     (self.prim_fn)(value, new_value);
+        // });
+        //
+        //
+        // self.process_last_group(groups, values_as_slice);
 
         Ok(())
     }
