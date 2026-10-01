@@ -15,23 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::aggregates::group_values::{GroupValues, HashValue};
+use crate::aggregates::group_values::GroupValues;
 use std::mem::size_of;
 use std::ops::SubAssign;
 use std::sync::Arc;
 
 use arrow::array::{
-  Array, ArrayRef, AsArray, GenericBinaryArray, GenericStringArray,
-  NullBufferBuilder, OffsetSizeTrait,
+    Array, ArrayRef, AsArray, GenericBinaryArray, GenericStringArray, NullBufferBuilder,
+    OffsetSizeTrait,
 };
 use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use datafusion_common::utils::proxy::VecAllocExt;
 use datafusion_common::utils::split_vec_min_alloc;
 use datafusion_common::{Result, internal_err, not_impl_err};
 use datafusion_expr::{EmitTo, GroupSelection};
-use datafusion_physical_expr_common::binary_map::{
-  INITIAL_BUFFER_CAPACITY, OutputType,
-};
+use datafusion_physical_expr_common::binary_map::{INITIAL_BUFFER_CAPACITY, OutputType};
 
 /// A [`GroupValues`] storing single column of Utf8/LargeUtf8/Binary/LargeBinary values
 ///
@@ -175,17 +173,11 @@ impl<O: OffsetSizeTrait + SubAssign> GroupValues for FullyOrderedGroupValuesByte
         let (col_offsets, col_buffer) = match self.output_type {
             OutputType::Utf8 => {
                 let col = col.as_string::<O>();
-                (
-                    col.offsets(),
-                    col.values().as_slice(),
-                )
+                (col.offsets(), col.values().as_slice())
             }
             OutputType::Binary => {
                 let col = col.as_binary::<O>();
-                (
-                    col.offsets(),
-                    col.values().as_slice(),
-                )
+                (col.offsets(), col.values().as_slice())
             }
             OutputType::Utf8View | OutputType::BinaryView => {
                 return internal_err!(
@@ -194,7 +186,7 @@ impl<O: OffsetSizeTrait + SubAssign> GroupValues for FullyOrderedGroupValuesByte
             }
         };
 
-        let mut current_value: Option<&[u8]> = if col.is_null(0) {
+        let current_value: Option<&[u8]> = if col.is_null(0) {
             None
         } else {
             let start = col_offsets[0];
@@ -273,15 +265,16 @@ impl<O: OffsetSizeTrait + SubAssign> GroupValues for FullyOrderedGroupValuesByte
                 self.offsets.push(self.last_offset);
                 self.buffer.extend_from_slice(current_value_valid);
 
+                // The offsets are absolute positions in `col_buffer`, so the
+                // buffer must not be sliced
                 let offsets_slice = &col_offsets[null_count..];
-                let buffers_slice = &col_buffer[offsets_slice[0].as_usize()..];
 
                 self.handle_valid(
                     groups,
                     current_value_valid,
                     current_group,
                     offsets_slice,
-                    buffers_slice,
+                    col_buffer,
                 );
             }
 
@@ -297,7 +290,7 @@ impl<O: OffsetSizeTrait + SubAssign> GroupValues for FullyOrderedGroupValuesByte
 
                 let offsets_slice = &col_offsets[..values_without_nulls + 1];
 
-                self.handle_valid(
+                current_group = self.handle_valid(
                     groups,
                     current_value_valid,
                     current_group,
@@ -354,33 +347,21 @@ impl<O: OffsetSizeTrait + SubAssign> GroupValues for FullyOrderedGroupValuesByte
                         self.offsets.len() - 1
                     );
                 }
-                // TODO - null group
-                let output_offsets = {
-                    let mut output_offsets = Vec::with_capacity(n + 1);
-                    // SAFETY: this is safe as we just allocated with this capacity
-                    // We validated we have enough data here
-                    unsafe {
-                        output_offsets.set_len(n + 1);
-                    };
+                let output_offsets = self.offsets[..=n].to_vec();
 
-                    output_offsets.copy_from_slice(&self.offsets[..=n]);
-                    // Move the offsets to the start
-                    self.offsets.copy_within(n.., 0);
-                    // Shrink capacity to the new length, so we don't hold on to memory we don't need
-                    self.offsets.shrink_to_fit();
+                // Move the offsets to the start
+                self.offsets.copy_within(n.., 0);
+                self.offsets.truncate(self.offsets.len() - n);
+                // Shrink capacity to the new length, so we don't hold on to memory we don't need
+                self.offsets.shrink_to_fit();
 
-                    // Shift the offset to start from 0
-                    let start_offset = output_offsets[0];
-                    self.offsets.iter_mut().for_each(|o| *o -= start_offset);
-                    self.last_offset = self.offsets.last().copied().unwrap();
+                // Shift the offset to start from 0
+                let start_offset = self.offsets[0];
+                self.offsets.iter_mut().for_each(|o| *o -= start_offset);
+                self.last_offset = self.offsets.last().copied().unwrap();
 
-                    output_offsets
-                };
-
-                let output_buffer = split_vec_min_alloc(
-                    &mut self.buffer,
-                    output_offsets.last().copied().unwrap().as_usize(),
-                );
+                let output_buffer =
+                    split_vec_min_alloc(&mut self.buffer, start_offset.as_usize());
                 let null_group = match &mut self.null_group {
                     Some(v) if *v >= n => {
                         *v -= n;
@@ -420,20 +401,22 @@ impl<O: OffsetSizeTrait + SubAssign> GroupValues for FullyOrderedGroupValuesByte
         self.offsets.push(self.last_offset);
 
         self.buffer.clear();
-        self.buffer.shrink_to(INITIAL_BUFFER_CAPACITY);
+        self.buffer.shrink_to(0);
+
+        self.null_group = None;
     }
 }
 
 #[cfg(test)]
 mod tests {
-  use super::*;
+    use super::*;
 
-  use std::sync::Arc;
+    use std::sync::Arc;
 
-  use arrow::array::StringArray;
-  use datafusion_physical_expr_common::binary_map::INITIAL_BUFFER_CAPACITY;
+    use arrow::array::StringArray;
+    use datafusion_physical_expr_common::binary_map::INITIAL_BUFFER_CAPACITY;
 
-  /// `clear_shrink` is how the aggregate stream hands memory back before it
+    /// `clear_shrink` is how the aggregate stream hands memory back before it
     /// spills and before the spilled batch is sorted, so the memory it releases
     /// has to actually show up in the size it reports afterwards.
     #[test]
