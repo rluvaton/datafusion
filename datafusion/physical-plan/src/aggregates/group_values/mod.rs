@@ -38,7 +38,10 @@ use crate::aggregates::{
         boolean::GroupValuesBoolean, bytes::GroupValuesBytes,
         bytes_view::GroupValuesBytesView, primitive::GroupValuesPrimitive,
     },
-    group_values::single_group_by_ordered::primitive::FullyOrderedGroupValuesPrimitive,
+    group_values::single_group_by_ordered::{
+        primitive::FullyOrderedGroupValuesPrimitive,
+        bytes::FullyOrderedGroupValuesBytes,
+    },
     order::GroupOrdering,
 };
 
@@ -162,7 +165,7 @@ pub fn new_group_values(
     if schema.fields.len() == 1 {
         let d = schema.fields[0].data_type();
 
-        macro_rules! downcast_helper {
+        macro_rules! downcast_primitive_helper {
             ($t:ty, $d:ident) => {
                 return Ok(if is_fully_ordered {
                     Box::new(FullyOrderedGroupValuesPrimitive::<$t>::new($d.clone()))
@@ -172,23 +175,24 @@ pub fn new_group_values(
                 })
             };
         }
+        macro_rules! downcast_bytes_helper {
+            ($offset:ident, $output_type:expr) => {
+                return Ok(if is_fully_ordered {
+                    Box::new(FullyOrderedGroupValuesBytes::<$offset>::new($output_type)) as Box<dyn GroupValues>
+                } else {
+                    Box::new(GroupValuesBytes::<$offset>::new($output_type)) as _
+                })
+            };
+        }
 
         downcast_primitive! {
-            d => (downcast_helper, d),
-            DataType::Utf8 => {
-                return Ok(Box::new(GroupValuesBytes::<i32>::new(OutputType::Utf8)));
-            }
-            DataType::LargeUtf8 => {
-                return Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Utf8)));
-            }
+            d => (downcast_primitive_helper, d),
+            DataType::Utf8 => downcast_bytes_helper!(i32, OutputType::Utf8),
+            DataType::LargeUtf8 => downcast_bytes_helper!(i64, OutputType::Utf8),
+            DataType::Binary => downcast_bytes_helper!(i32, OutputType::Binary),
+            DataType::LargeBinary => downcast_bytes_helper!(i64, OutputType::Binary),
             DataType::Utf8View => {
                 return Ok(Box::new(GroupValuesBytesView::new(OutputType::Utf8View)));
-            }
-            DataType::Binary => {
-                return Ok(Box::new(GroupValuesBytes::<i32>::new(OutputType::Binary)));
-            }
-            DataType::LargeBinary => {
-                return Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Binary)));
             }
             DataType::BinaryView => {
                 return Ok(Box::new(GroupValuesBytesView::new(OutputType::BinaryView)));

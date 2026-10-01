@@ -18,3 +18,4 @@
 //! `GroupValues` implementations for single group by cases where it is fully ordered
 
 pub(crate) mod primitive;
+pub(crate) mod bytes;
