@@ -41,6 +41,7 @@ use crate::aggregates::{
     group_values::single_group_by_ordered::{
         primitive::FullyOrderedGroupValuesPrimitive,
         bytes::FullyOrderedGroupValuesBytes,
+        bytes_view::FullyOrderedGroupValuesBytesView,
     },
     order::GroupOrdering,
 };
@@ -185,18 +186,25 @@ pub fn new_group_values(
             };
         }
 
+        macro_rules! downcast_bytes_view_helper {
+            ($output_type:expr) => {
+                return Ok(if is_fully_ordered {
+                    Box::new(FullyOrderedGroupValuesBytesView::new($output_type))
+                        as Box<dyn GroupValues>
+                } else {
+                    Box::new(GroupValuesBytesView::new($output_type)) as _
+                })
+            };
+        }
+
         downcast_primitive! {
             d => (downcast_primitive_helper, d),
             DataType::Utf8 => downcast_bytes_helper!(i32, OutputType::Utf8),
             DataType::LargeUtf8 => downcast_bytes_helper!(i64, OutputType::Utf8),
             DataType::Binary => downcast_bytes_helper!(i32, OutputType::Binary),
             DataType::LargeBinary => downcast_bytes_helper!(i64, OutputType::Binary),
-            DataType::Utf8View => {
-                return Ok(Box::new(GroupValuesBytesView::new(OutputType::Utf8View)));
-            }
-            DataType::BinaryView => {
-                return Ok(Box::new(GroupValuesBytesView::new(OutputType::BinaryView)));
-            }
+            DataType::Utf8View => downcast_bytes_view_helper!(OutputType::Utf8View),
+            DataType::BinaryView => downcast_bytes_view_helper!(OutputType::BinaryView),
             DataType::Boolean => {
                 return Ok(Box::new(GroupValuesBoolean::new()));
             }
