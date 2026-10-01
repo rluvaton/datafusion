@@ -606,8 +606,7 @@ pub fn accumulate_multiple_ordered<T, F>(
   F: FnMut(usize, usize, &[&PrimitiveArray<T>]) + Send,
 {
     for col in value_columns.iter() {
-        // TODO - total number of rows, not groups
-        debug_assert_eq!(col.len(), groups.total_number_of_groups());
+        debug_assert_eq!(col.len(), groups.total_number_of_rows());
     }
 
     // Start with rows where all value columns are non-null.
@@ -619,8 +618,7 @@ pub fn accumulate_multiple_ordered<T, F>(
     // as a raw BooleanBuffer to avoid computing a NullBuffer null_count just to
     // test row validity below.
     if let Some(filter) = opt_filter {
-        // TODO - total number of rows, not groups
-        debug_assert_eq!(filter.len(), groups.total_number_of_groups());
+        debug_assert_eq!(filter.len(), groups.total_number_of_rows());
         let filter_validity = filter_to_validity(filter);
         if let Some(valid_indices) = valid_indices.as_mut() {
             *valid_indices &= &filter_validity;

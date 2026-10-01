@@ -2,7 +2,7 @@ use std::fmt::Debug;
 use std::ops::Range;
 use arrow::array::{ArrayRef, BooleanArray};
 use datafusion_common::Result;
-use crate::groups_accumulator::EmitTo;
+use crate::groups_accumulator::{EmitTo, GroupsAccumulator};
 
 pub trait ProcessGroups {
   type A: OrderedGroupsAccumulator;
@@ -76,7 +76,7 @@ pub struct GroupsInfo {
   // TODO - THIS IS a problem with the Boolean since the range would not be continues
   groups: Vec<PartitionRange>,
   properties: GroupsProperties,
-  total_number_of_groups: usize,
+  total_number_of_rows: usize,
 }
 
 impl GroupsInfo {
@@ -107,6 +107,8 @@ impl GroupsInfo {
     }
   }
 
+  // TODO - support nulls and filter, and multiple input columns
+  //        also, the user should
   pub fn process<Processor: ProcessGroups>(&self, input: &[ArrayRef], opt_filter: Option<&BooleanArray>, groups_accu: &mut Processor::A) -> Result<()> {
     // TODO - this is only if input is non null
     assert_eq!(input.len(), 1, "single argument to update_batch");
@@ -168,8 +170,16 @@ impl GroupsInfo {
     // self.groups.iter().enumerate().flat_map(|(group_index, group)| std::iter::repeat_n(group_index, group.len()))
   }
 
-  pub fn total_number_of_groups(&self) -> usize {
-    self.total_number_of_groups
+  pub fn total_number_of_rows(&self) -> usize {
+    self.total_number_of_rows
+  }
+
+  pub fn num_new_groups(&self) -> usize {
+    if self.is_first_group_same_as_before() {
+      self.groups.len() - 1
+    } else {
+      self.groups.len()
+    }
   }
 
   pub fn is_first_group_same_as_before(&self) -> bool {
@@ -269,6 +279,55 @@ pub trait OrderedGroupsAccumulator: Send + std::any::Any {
 
   /// TODO - Size on the heap? or including stack? since size_of will get the size I think but not sure for Box<dyn>
   fn size(&self) -> usize;
+}
+
+pub struct OrderedGroupsAccumulatorWrapper {
+  inner: Box<dyn GroupsAccumulator>,
+  total_number_of_groups: usize,
+}
+
+impl From<Box<dyn GroupsAccumulator>> for OrderedGroupsAccumulatorWrapper
+{
+  fn from(inner: Box<dyn GroupsAccumulator>) -> Self {
+    Self {
+      inner,
+      total_number_of_groups: 0,
+    }
+  }
+}
+
+impl OrderedGroupsAccumulator for OrderedGroupsAccumulatorWrapper {
+  fn update_batch(&mut self, input: &[ArrayRef], groups: &GroupsInfo, opt_filter: Option<&BooleanArray>) -> Result<()> {
+    self.total_number_of_groups += groups.num_new_groups();
+    let group_indices = groups.as_iter_of_group_indices().map(|(group_index, _row_index)| group_index).collect::<Vec<_>>();
+    self.inner.update_batch(input, &group_indices, opt_filter, self.total_number_of_groups)
+  }
+
+  fn merge_batch(&mut self, input: &[ArrayRef], groups: &GroupsInfo) -> Result<()> {
+    self.total_number_of_groups += groups.num_new_groups();
+    let group_indices = groups.as_iter_of_group_indices().map(|(group_index, _row_index)| group_index).collect::<Vec<_>>();
+    self.inner.merge_batch(input, &group_indices, self.total_number_of_groups)
+  }
+
+  fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+    match emit_to {
+      EmitTo::All => self.total_number_of_groups = 0,
+      EmitTo::First(n) => self.total_number_of_groups -= n,
+    }
+    self.inner.state(emit_to)
+  }
+
+  fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+    match emit_to {
+      EmitTo::All => self.total_number_of_groups = 0,
+      EmitTo::First(n) => self.total_number_of_groups -= n,
+    }
+    self.inner.evaluate(emit_to)
+  }
+
+  fn size(&self) -> usize {
+    self.inner.size()
+  }
 }
 //
 //

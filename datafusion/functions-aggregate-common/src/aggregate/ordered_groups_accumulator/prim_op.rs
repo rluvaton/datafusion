@@ -222,9 +222,9 @@ where
         if groups.are_all_single_item_ignoring_edges() {
             // TODO - handle the case where group does not start from 0 and not ends at the last group? also can it have gaps?
             assert_ne!(
-                groups.total_number_of_groups(),
-                1,
-                "must not have only one group and same as before here since dont want to push the in progress value yet"
+              groups.groups().len(),
+              1,
+              "must not have only one group and same as before here since dont want to push the in progress value yet"
             );
 
             self.update_batch_in_single_item(groups, values_as_slice)?;
