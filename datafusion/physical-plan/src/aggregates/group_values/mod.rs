@@ -21,7 +21,7 @@ use arrow::array::{ArrayRef, downcast_primitive};
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::{Result, not_impl_err};
 
-use datafusion_expr::{EmitTo, GroupSelection};
+use datafusion_expr::{EmitTo, GroupSelection, GroupsInfo};
 
 pub mod multi_group_by;
 
@@ -41,8 +41,11 @@ use crate::aggregates::{
     order::GroupOrdering,
 };
 
+mod groups_info;
 mod metrics;
 mod null_builder;
+
+pub(crate) use groups_info::{groups_info_from_group_indices, groups_info_from_ranges};
 
 pub(crate) use metrics::{
     AccumulatorPhase, AggregateAccumulatorMetrics, AggregateArgumentMetrics,
@@ -96,6 +99,28 @@ pub trait GroupValues: Send {
     /// assigned. If a row has a new value, the next available group id is
     /// assigned.
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()>;
+
+    /// Like [`Self::intern`], for input that is fully sorted by the group keys:
+    /// returns the groups of `cols` as contiguous runs of consecutive group ids
+    /// instead of one group id per row.
+    ///
+    /// Returns `None` when `cols` has no rows.
+    ///
+    /// The default implementation calls [`Self::intern`] with the
+    /// `scratch_groups` buffer and builds the runs from it. Implementations
+    /// that already find the runs should override it to skip the per-row ids.
+    fn intern_ordered(
+        &mut self,
+        cols: &[ArrayRef],
+        scratch_groups: &mut Vec<usize>,
+    ) -> Result<Option<GroupsInfo>> {
+        let starting_num_groups = self.len();
+        self.intern(cols, scratch_groups)?;
+        if scratch_groups.is_empty() {
+            return Ok(None);
+        }
+        groups_info_from_group_indices(scratch_groups, starting_num_groups).map(Some)
+    }
 
     /// Returns the number of bytes of memory used by this [`GroupValues`].
     ///

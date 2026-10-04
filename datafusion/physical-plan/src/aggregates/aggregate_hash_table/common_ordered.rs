@@ -26,9 +26,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, internal_err};
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
-use datafusion_expr::ordered_groups_accumulator::{
-    GroupsProperties, OrderedGroupsAccumulatorWrapper, PartitionRange,
-};
+use datafusion_expr::ordered_groups_accumulator::OrderedGroupsAccumulatorWrapper;
 use datafusion_expr::{AggregateMetrics, EmitTo, GroupsInfo, OrderedGroupsAccumulator};
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 
@@ -250,61 +248,6 @@ impl OrderedAggregateAccumulator {
     }
 }
 
-/// Builds the [`GroupsInfo`] of one input batch from its interned group
-/// indices when the input is fully sorted by the group keys.
-///
-/// `starting_num_groups` is the number of groups before interning the batch.
-/// The first run continues the previous batch's last group when its index is
-/// `starting_num_groups - 1`, and every following run must use the next index.
-fn build_groups_info(
-    group_indices: &[usize],
-    starting_num_groups: usize,
-) -> Result<GroupsInfo> {
-    debug_assert!(!group_indices.is_empty());
-
-    let mut groups = Vec::new();
-    let mut start = 0;
-    let mut expected_group_index = None;
-    for run in group_indices.chunk_by(|a, b| a == b) {
-        let group_index = run[0];
-        let is_same_as_before = match expected_group_index {
-            None if group_index + 1 == starting_num_groups => true,
-            None if group_index == starting_num_groups => false,
-            Some(expected) if group_index == expected => false,
-            _ => {
-                return internal_err!(
-                    "ordered aggregation expects contiguous group indices, got group {group_index} \
-                     after {expected_group_index:?} (starting with {starting_num_groups} groups)"
-                );
-            }
-        };
-        groups.push(PartitionRange {
-            start,
-            end: start + run.len(),
-            is_same_as_before,
-        });
-        start += run.len();
-        expected_group_index = Some(group_index + 1);
-    }
-
-    // Leading run of single item groups, allowing the first group (which may
-    // continue the previous batch) to have more than one item.
-    let single_item_start = usize::from(groups[0].len() != 1);
-    let single_item_end = single_item_start
-        + groups[single_item_start..]
-            .iter()
-            .take_while(|group| group.len() == 1)
-            .count();
-
-    Ok(GroupsInfo::new(
-        groups,
-        GroupsProperties {
-            range_of_single_item_groups: single_item_start..single_item_end,
-        },
-        group_indices[0],
-    ))
-}
-
 /// Aggregate table shared by the ordered single, partial and final paths.
 ///
 /// # Ordering optimization
@@ -393,6 +336,9 @@ pub(super) struct OrderedAggregateTableBuffer {
     pub(super) group_values: Box<dyn GroupValues>,
 
     /// Scratch group id vector for the current input batch.
+    ///
+    /// Unused with `use_ordered_accumulators` when the group values return the
+    /// groups as runs directly (see [`GroupValues::intern_ordered`]).
     pub(super) group_indices: Vec<usize>,
 
     /// Whether the accumulators are [`OrderedAggregateAccumulator::Ordered`].
@@ -623,36 +569,50 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
         let accumulator_metrics = Arc::clone(&self.aggregate_accumulator_metrics);
         let group_by_metrics = self.group_by_metrics.clone();
         for group_values in &evaluated_batch.grouping_set_args {
-            let (starting_num_groups, total_num_groups) = group_by_metrics
-                .time_group_key_preparation(|| {
-                    let starting_num_groups = self.buffer.group_values.len();
-                    self.buffer
-                        .group_values
-                        .intern(group_values, &mut self.buffer.group_indices)?;
-                    let total_num_groups = self.buffer.group_values.len();
-                    if total_num_groups > starting_num_groups {
-                        self.buffer.group_ordering.new_groups(
-                            group_values,
-                            &self.buffer.group_indices,
-                            total_num_groups,
-                        )?;
-                    }
-                    Ok::<_, datafusion_common::DataFusionError>((
-                        starting_num_groups,
-                        total_num_groups,
-                    ))
-                })?;
-
             let groups_info;
             let batch_groups = if self.buffer.use_ordered_accumulators {
-                if self.buffer.group_indices.is_empty() {
+                // The input is sorted by the group keys, so the group values
+                // return the groups as contiguous runs without per-row group ids
+                let opt_groups_info =
+                    group_by_metrics.time_group_key_preparation(|| {
+                        let starting_num_groups = self.buffer.group_values.len();
+                        let opt_groups_info = self.buffer.group_values.intern_ordered(
+                            group_values,
+                            &mut self.buffer.group_indices,
+                        )?;
+                        let total_num_groups = self.buffer.group_values.len();
+                        if total_num_groups > starting_num_groups {
+                            // Fully sorted group ordering only needs the number of groups
+                            self.buffer.group_ordering.new_groups(
+                                group_values,
+                                &[],
+                                total_num_groups,
+                            )?;
+                        }
+                        Ok::<_, datafusion_common::DataFusionError>(opt_groups_info)
+                    })?;
+                let Some(opt_groups_info) = opt_groups_info else {
                     continue;
-                }
-                groups_info = group_by_metrics.time_group_key_preparation(|| {
-                    build_groups_info(&self.buffer.group_indices, starting_num_groups)
-                })?;
+                };
+                groups_info = opt_groups_info;
                 BatchGroups::Ordered(&groups_info)
             } else {
+                let total_num_groups =
+                    group_by_metrics.time_group_key_preparation(|| {
+                        let starting_num_groups = self.buffer.group_values.len();
+                        self.buffer
+                            .group_values
+                            .intern(group_values, &mut self.buffer.group_indices)?;
+                        let total_num_groups = self.buffer.group_values.len();
+                        if total_num_groups > starting_num_groups {
+                            self.buffer.group_ordering.new_groups(
+                                group_values,
+                                &self.buffer.group_indices,
+                                total_num_groups,
+                            )?;
+                        }
+                        Ok::<_, datafusion_common::DataFusionError>(total_num_groups)
+                    })?;
                 BatchGroups::Indices {
                     group_indices: &self.buffer.group_indices,
                     total_num_groups,
@@ -709,60 +669,5 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
         debug_assert!(batch.num_rows() > 0);
 
         Ok(batch)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ranges(info: &GroupsInfo) -> Vec<(usize, usize, bool)> {
-        info.groups()
-            .iter()
-            .map(|g| (g.start, g.end, g.is_same_as_before))
-            .collect()
-    }
-
-    #[test]
-    fn build_groups_info_first_batch() -> Result<()> {
-        let info = build_groups_info(&[0, 0, 1, 2, 3, 3], 0)?;
-        assert_eq!(
-            ranges(&info),
-            vec![(0, 2, false), (2, 3, false), (3, 4, false), (4, 6, false)]
-        );
-        assert_eq!(info.properties().range_of_single_item_groups, 1..3);
-        assert_eq!(info.total_number_of_groups(), 4);
-        assert_eq!(info.num_new_groups(), 4);
-        Ok(())
-    }
-
-    #[test]
-    fn build_groups_info_continues_previous_group() -> Result<()> {
-        // 3 groups already interned, the batch starts with the last one (index 2)
-        let info = build_groups_info(&[2, 2, 3], 3)?;
-        assert_eq!(ranges(&info), vec![(0, 2, true), (2, 3, false)]);
-        assert_eq!(info.total_number_of_groups(), 4);
-        assert_eq!(info.num_new_groups(), 1);
-
-        // the batch starts a new group
-        let info = build_groups_info(&[3, 4, 5], 3)?;
-        assert_eq!(
-            ranges(&info),
-            vec![(0, 1, false), (1, 2, false), (2, 3, false)]
-        );
-        assert_eq!(info.properties().range_of_single_item_groups, 0..3);
-        assert!(info.are_all_single_item());
-        assert_eq!(info.total_number_of_groups(), 6);
-        Ok(())
-    }
-
-    #[test]
-    fn build_groups_info_rejects_non_contiguous_groups() {
-        // revisits a group
-        assert!(build_groups_info(&[0, 1, 0], 0).is_err());
-        // skips a group index
-        assert!(build_groups_info(&[0, 2], 0).is_err());
-        // starts with a group that is neither the last one nor a new one
-        assert!(build_groups_info(&[0, 1], 2).is_err());
     }
 }

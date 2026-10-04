@@ -17,35 +17,37 @@
 
 use std::sync::Arc;
 
-use crate::aggregate::groups_accumulator::nulls::filtered_null_mask;
-use arrow::array::{ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder};
+use crate::aggregate::groups_accumulator::accumulate::NullState;
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder};
 use arrow::buffer::BooleanBuffer;
 use datafusion_common::Result;
-use datafusion_expr_common::groups_accumulator::{
-    EmitTo, GroupSelection, GroupsAccumulator,
+use datafusion_expr_common::groups_accumulator::EmitTo;
+use datafusion_expr_common::ordered_groups_accumulator::{
+    GroupsInfo, OrderedGroupsAccumulator, PartitionRange, ProcessGroups,
 };
 
-use super::accumulate::OrderedNullState;
-
-/// An accumulator that implements a single operation over a
+/// An [`OrderedGroupsAccumulator`] that implements a single operation over a
 /// [`BooleanArray`] where the accumulated state is also boolean (such
 /// as [`BitAndAssign`])
 ///
 /// F: The function to apply to two elements. The first argument is
-/// the existing value and should be updated with the second value
-/// (e.g. [`BitAndAssign`] style).
+/// the existing value and the second is the new value, it returns the
+/// combined value (e.g. [`BitAndAssign`] style).
 ///
 /// [`BitAndAssign`]: std::ops::BitAndAssign
 #[derive(Debug)]
-pub struct BooleanGroupsAccumulator<F>
+pub struct BooleanOrderedGroupsAccumulator<F>
 where
     F: Fn(bool, bool) -> bool + Send + Sync + 'static,
 {
-    /// values per group
-    values: BooleanBufferBuilder,
+    /// values of the groups that are done and ready to be emitted
+    ready_values: BooleanBufferBuilder,
+
+    /// value of the current in progress group
+    in_progress: bool,
 
     /// Track nulls in the input / filters
-    null_state: OrderedNullState,
+    null_state: NullState,
 
     /// Function that computes the output
     bool_fn: F,
@@ -55,178 +57,184 @@ where
     identity: bool,
 }
 
-impl<F> BooleanGroupsAccumulator<F>
+impl<F> BooleanOrderedGroupsAccumulator<F>
 where
     F: Fn(bool, bool) -> bool + Send + Sync + 'static,
 {
     pub fn new(bool_fn: F, identity: bool) -> Self {
         Self {
-            values: BooleanBufferBuilder::new(0),
-            null_state: OrderedNullState::new(),
+            ready_values: BooleanBufferBuilder::new(0),
+            in_progress: identity,
+            null_state: NullState::new(),
             bool_fn,
             identity,
         }
     }
+
+    fn fold(&self, current: bool, values: &BooleanBuffer, group: &PartitionRange) -> bool {
+        group
+            .as_range()
+            .fold(current, |acc, row_index| (self.bool_fn)(acc, values.value(row_index)))
+    }
 }
 
-impl<F> GroupsAccumulator for BooleanGroupsAccumulator<F>
+impl<F> OrderedGroupsAccumulator for BooleanOrderedGroupsAccumulator<F>
 where
     F: Fn(bool, bool) -> bool + Send + Sync + 'static,
 {
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        groups: &GroupsInfo,
         opt_filter: Option<&BooleanArray>,
-        total_num_groups: usize,
     ) -> Result<()> {
         assert_eq!(values.len(), 1, "single argument to update_batch");
         let values = values[0].as_boolean();
 
-        if self.values.len() < total_num_groups {
-            let new_groups = total_num_groups - self.values.len();
-            // Fill with the identity element, so that when the first non-null value is encountered,
-            // it will combine with the identity and the result will be the first non-null value itself.
-            self.values.append_n(new_groups, self.identity);
+        struct BoolOpProcessor<'a, F>
+        where
+            F: Fn(bool, bool) -> bool + Send + Sync + 'static,
+        {
+            acc: &'a mut BooleanOrderedGroupsAccumulator<F>,
+            values: &'a BooleanBuffer,
         }
 
-        // NullState dispatches / handles tracking nulls and groups that saw no values
-        self.null_state.accumulate_boolean(
-            group_indices,
-            values,
-            opt_filter,
-            total_num_groups,
-            |group_index, new_value| {
-                let current_value = self.values.get_bit(group_index);
-                let value = (self.bool_fn)(current_value, new_value);
-                self.values.set_bit(group_index, value);
-            },
-        );
-
-        Ok(())
-    }
-
-    fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        let values = self.values.finish();
-
-        let values = match emit_to {
-            EmitTo::All => values,
-            EmitTo::First(n) => {
-                let first_n: BooleanBuffer = values.iter().take(n).collect();
-                // put n+1 back into self.values
-                for v in values.iter().skip(n) {
-                    self.values.append(v);
-                }
-                first_n
+        impl<F> ProcessGroups for BoolOpProcessor<'_, F>
+        where
+            F: Fn(bool, bool) -> bool + Send + Sync + 'static,
+        {
+            fn on_new_standalone_group(&mut self, group: &PartitionRange, _group_index: usize) {
+                let value = self.acc.fold(self.acc.identity, self.values, group);
+                self.acc.ready_values.append(value);
             }
-        };
 
-        let nulls = self.null_state.build(emit_to);
-        let values = BooleanArray::new(values, nulls);
-        Ok(Arc::new(values))
-    }
+            fn flush_in_progress_group(
+                &mut self,
+                opt_group: Option<&PartitionRange>,
+                _group_index: usize,
+            ) {
+                let mut value = self.acc.in_progress;
+                if let Some(group) = opt_group {
+                    value = self.acc.fold(value, self.values, group);
+                }
+                self.acc.ready_values.append(value);
+                self.acc.in_progress = self.acc.identity;
+            }
 
-    fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
-        selection.validate_num_groups(self.values.len())?;
-        let mut values = BooleanBufferBuilder::new(selection.len());
-        for index in selection.iter() {
-            values.append(self.values.get_bit(index));
+            fn add_last_group(&mut self, last_group: &PartitionRange, _group_index: usize) {
+                self.acc.in_progress =
+                    self.acc.fold(self.acc.in_progress, self.values, last_group);
+            }
+
+            fn fallback(&mut self, row_index: usize, _group_index: usize) {
+                self.acc.in_progress =
+                    (self.acc.bool_fn)(self.acc.in_progress, self.values.value(row_index));
+            }
         }
-        let nulls = self.null_state.build_preserving(selection)?;
-        Ok(Arc::new(BooleanArray::new(values.finish(), nulls)))
+
+        if opt_filter.is_some() || values.null_count() > 0 {
+            let group_indices = groups.as_iter_of_group_indices().collect::<Vec<_>>();
+            self.null_state.accumulate_boolean(
+                &group_indices,
+                values,
+                opt_filter,
+                groups.total_number_of_groups(),
+                |_group_index, _new_value| {
+                    // values are processed below
+                },
+            );
+        } else {
+            self.null_state
+                .mark_addition_not_nulls(groups.total_number_of_groups());
+        }
+
+        groups.process(
+            values.nulls(),
+            opt_filter,
+            &mut BoolOpProcessor {
+                acc: self,
+                values: values.values(),
+            },
+        )
     }
 
-    fn supports_evaluate_preserving(&self) -> bool {
-        true
+    fn merge_batch(&mut self, values: &[ArrayRef], groups: &GroupsInfo) -> Result<()> {
+        // update / merge are the same
+        self.update_batch(values, groups, None)
     }
 
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         self.evaluate(emit_to).map(|arr| vec![arr])
     }
 
-    fn state_preserving(
-        &mut self,
-        selection: GroupSelection<'_>,
-    ) -> Result<Vec<ArrayRef>> {
-        self.evaluate_preserving(selection).map(|arr| vec![arr])
-    }
+    fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        let nulls = self.null_state.build(emit_to);
+        let ready_len = self.ready_values.len();
+        let values = match emit_to {
+            EmitTo::First(n) if n <= ready_len => {
+                let ready = self.ready_values.finish();
+                self.ready_values.append_buffer(&ready.slice(n, ready_len - n));
+                ready.slice(0, n)
+            }
+            // Include the in progress group
+            EmitTo::All | EmitTo::First(_) => {
+                self.ready_values.append(self.in_progress);
+                self.in_progress = self.identity;
+                self.ready_values.finish()
+            }
+        };
 
-    fn supports_state_preserving(&self) -> bool {
-        true
-    }
-
-    fn merge_batch(
-        &mut self,
-        values: &[ArrayRef],
-        group_indices: &[usize],
-        total_num_groups: usize,
-    ) -> Result<()> {
-        // update / merge are the same
-        self.update_batch(values, group_indices, None, total_num_groups)
+        Ok(Arc::new(BooleanArray::new(values, nulls)))
     }
 
     fn size(&self) -> usize {
         // capacity is in bits, so convert to bytes
-        self.values.capacity() / 8 + self.null_state.size()
-    }
-
-    fn convert_to_state(
-        &self,
-        values: &[ArrayRef],
-        opt_filter: Option<&BooleanArray>,
-    ) -> Result<Vec<ArrayRef>> {
-        let values = values[0].as_boolean().clone();
-
-        let values_null_buffer_filtered = filtered_null_mask(opt_filter, &values);
-        let (values_buf, _) = values.into_parts();
-        let values_filtered = BooleanArray::new(values_buf, values_null_buffer_filtered);
-
-        Ok(vec![Arc::new(values_filtered)])
+        self.ready_values.capacity() / 8 + self.null_state.size()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion_expr_common::ordered_groups_accumulator::GroupsProperties;
+
+    fn groups_info(ranges: &[(usize, usize, bool)], start_group_index: usize) -> GroupsInfo {
+        GroupsInfo::new(
+            ranges
+                .iter()
+                .map(|&(start, end, is_same_as_before)| PartitionRange {
+                    start,
+                    end,
+                    is_same_as_before,
+                })
+                .collect(),
+            GroupsProperties {
+                range_of_single_item_groups: 0..0,
+            },
+            start_group_index,
+        )
+    }
 
     #[test]
-    fn boolean_groups_preserving_reads() -> Result<()> {
+    fn bool_and_across_batches() -> Result<()> {
         let mut accumulator =
-            BooleanGroupsAccumulator::new(|current, value| current && value, true);
-        let values = Arc::new(BooleanArray::from(vec![
-            Some(true),
-            Some(false),
-            None,
-            Some(true),
-        ]));
-        accumulator.update_batch(&[values], &[0, 0, 1, 2], None, 4)?;
+            BooleanOrderedGroupsAccumulator::new(|current, value| current && value, true);
 
-        let selection = GroupSelection::try_from_indices(&[2, 0, 3, 2], 4)?;
-        let expected =
-            BooleanArray::from(vec![Some(true), Some(false), None, Some(true)]);
-        for _ in 0..2 {
-            assert_eq!(
-                accumulator.evaluate_preserving(selection)?.as_boolean(),
-                &expected
-            );
-            assert_eq!(
-                accumulator.state_preserving(selection)?[0].as_boolean(),
-                &expected
-            );
-        }
+        // groups: 0 = [true, false], 1 = [true] (in progress)
+        let values = Arc::new(BooleanArray::from(vec![true, false, true]));
+        accumulator.update_batch(&[values], &groups_info(&[(0, 2, false), (2, 3, false)], 0), None)?;
 
-        let empty =
-            accumulator.evaluate_preserving(GroupSelection::try_from_indices(&[], 4)?)?;
-        assert!(empty.is_empty());
+        // group 1 continues with [true, null], group 2 = [false]
+        let values = Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)]));
+        accumulator.update_batch(&[values], &groups_info(&[(0, 2, true), (2, 3, false)], 1), None)?;
 
-        let values = Arc::new(BooleanArray::from(vec![false, true]));
-        accumulator.update_batch(&[values], &[1, 3], None, 4)?;
-        let expected = BooleanArray::from(vec![false, false, true, true]);
         assert_eq!(
-            accumulator
-                .evaluate_preserving(GroupSelection::all(4))?
-                .as_boolean(),
-            &expected
+            accumulator.evaluate(EmitTo::First(2))?.as_boolean(),
+            &BooleanArray::from(vec![false, true])
+        );
+        assert_eq!(
+            accumulator.evaluate(EmitTo::All)?.as_boolean(),
+            &BooleanArray::from(vec![false])
         );
         Ok(())
     }

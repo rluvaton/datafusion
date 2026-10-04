@@ -16,16 +16,18 @@
 // under the License.
 
 use std::mem;
+use std::ops::Range;
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_ord::partition::partition;
 use datafusion_common::{Result, not_impl_err};
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
-use datafusion_expr::{EmitTo, GroupSelection};
+use datafusion_expr::ordered_groups_accumulator::PartitionRange;
+use datafusion_expr::{EmitTo, GroupSelection, GroupsInfo};
 
 use super::{GroupColumn, GroupValuesColumn};
-use crate::aggregates::group_values::GroupValues;
+use crate::aggregates::group_values::{GroupValues, groups_info_from_ranges};
 
 /// Columnar group keys for input fully ordered by all grouping expressions.
 ///
@@ -84,14 +86,19 @@ impl GroupValuesOrdered {
             new_groups: Vec::new(),
         })
     }
-}
 
-impl GroupValues for GroupValuesOrdered {
-    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
-        groups.clear();
+    /// Finds the runs of equal keys in `cols` and appends the keys of the new
+    /// groups.
+    ///
+    /// Returns the runs, whether the first run continues the last buffered
+    /// group and the group id of the first run, or `None` when `cols` has no rows.
+    fn intern_runs(
+        &mut self,
+        cols: &[ArrayRef],
+    ) -> Result<Option<(Vec<Range<usize>>, bool, usize)>> {
         let ranges = partition(cols)?.ranges();
         if ranges.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         let old_len = self.len();
@@ -114,10 +121,40 @@ impl GroupValues for GroupValuesOrdered {
         }
 
         let first_group = old_len - usize::from(continues);
+        Ok(Some((ranges, continues, first_group)))
+    }
+}
+
+impl GroupValues for GroupValuesOrdered {
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+        groups.clear();
+        let Some((ranges, _continues, first_group)) = self.intern_runs(cols)? else {
+            return Ok(());
+        };
         for (index, range) in ranges.iter().enumerate() {
             groups.resize(range.end, first_group + index);
         }
         Ok(())
+    }
+
+    fn intern_ordered(
+        &mut self,
+        cols: &[ArrayRef],
+        _scratch_groups: &mut Vec<usize>,
+    ) -> Result<Option<GroupsInfo>> {
+        let Some((ranges, continues, first_group)) = self.intern_runs(cols)? else {
+            return Ok(None);
+        };
+        let groups = ranges
+            .into_iter()
+            .enumerate()
+            .map(|(index, range)| PartitionRange {
+                start: range.start,
+                end: range.end,
+                is_same_as_before: index == 0 && continues,
+            })
+            .collect();
+        Ok(Some(groups_info_from_ranges(groups, first_group)))
     }
 
     fn size(&self) -> usize {
@@ -312,6 +349,65 @@ mod tests {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    // `intern_ordered` must describe the same groups as `intern`, including a
+    // first run that continues the last buffered group.
+    #[test]
+    fn intern_ordered_matches_intern_across_batches_and_emits() -> Result<()> {
+        let rows = 1025;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let input: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from_iter_values((0..rows).map(|row| row / 28))),
+            Arc::new(Int32Array::from_iter_values(
+                (0..rows).map(|row| (row / 7) % 4),
+            )),
+        ];
+        for batch_size in [1, 2, 7, 8, 63, 1024] {
+            let mut by_rows = GroupValuesOrdered::try_new(Arc::clone(&schema))?;
+            let mut by_runs = GroupValuesOrdered::try_new(Arc::clone(&schema))?;
+            let mut expected = Vec::new();
+            let mut scratch = Vec::new();
+            for offset in (0..rows as usize).step_by(batch_size) {
+                let length = batch_size.min(rows as usize - offset);
+                let batch = input
+                    .iter()
+                    .map(|array| array.slice(offset, length))
+                    .collect::<Vec<_>>();
+                let starting_num_groups = by_runs.len();
+                by_rows.intern(&batch, &mut expected)?;
+                let groups = by_runs
+                    .intern_ordered(&batch, &mut scratch)?
+                    .expect("non empty batch");
+                assert_eq!(
+                    groups.as_iter_of_group_indices().collect::<Vec<_>>(),
+                    expected,
+                    "batch={batch_size}, offset={offset}"
+                );
+                assert_eq!(
+                    groups.is_first_group_same_as_before(),
+                    expected[0] < starting_num_groups
+                );
+                assert_eq!(groups.total_number_of_groups(), by_runs.len());
+
+                let empty = batch
+                    .iter()
+                    .map(|array| array.slice(0, 0))
+                    .collect::<Vec<_>>();
+                assert!(by_runs.intern_ordered(&empty, &mut scratch)?.is_none());
+
+                let emit = by_rows.len().saturating_sub(1);
+                assert_eq!(
+                    by_runs.emit(EmitTo::First(emit))?,
+                    by_rows.emit(EmitTo::First(emit))?
+                );
+            }
+            assert_eq!(by_runs.emit(EmitTo::All)?, by_rows.emit(EmitTo::All)?);
         }
         Ok(())
     }

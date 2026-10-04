@@ -18,16 +18,15 @@
 use std::mem::size_of;
 use std::sync::Arc;
 
-use super::accumulate::OrderedNullState;
-use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array, PrimitiveArray};
-use arrow::buffer::NullBuffer;
-use arrow::compute;
+use crate::aggregate::groups_accumulator::accumulate::NullState;
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray};
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::datatypes::DataType;
-use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
+use datafusion_common::Result;
 use datafusion_expr_common::groups_accumulator::EmitTo;
-use datafusion_expr_common::ordered_groups_accumulator::{AllSingleItemType, GroupsInfo, OrderedGroupsAccumulator, PartitionRange, ProcessGroups};
-use crate::aggregate::groups_accumulator::accumulate::NullState;
+use datafusion_expr_common::ordered_groups_accumulator::{
+    GroupsInfo, OrderedGroupsAccumulator, PartitionRange, ProcessGroups,
+};
 
 /// An accumulator that implements a single operation over
 /// [`ArrowPrimitiveType`] where the accumulated state is the same as
@@ -94,7 +93,9 @@ where
         assert!(groups.are_all_single_item_ignoring_edges());
 
         // If we started a new group, move the last group to the ready groups
-        if !groups.is_first_group_same_as_before() {
+        // (there is no previous group when this batch starts from group 0)
+        let has_previous_group = groups.total_number_of_groups() > groups.groups().len();
+        if !groups.is_first_group_same_as_before() && has_previous_group {
             // Push the finished in progress value from last groups
             self.ready_values.push(self.in_progress);
             self.in_progress = self.starting_value;
@@ -196,6 +197,18 @@ where
 
         let values_as_slice = values.values().as_ref();
 
+        // A single group is trivially "all single items ignoring edges" but
+        // `update_batch_in_single_item` requires at least 2 groups
+        if !groups.is_single_group()
+            && groups.are_all_single_item_ignoring_edges()
+            && opt_filter.is_none()
+            && values.null_count() == 0
+        {
+            self.null_state
+                .mark_addition_not_nulls(groups.total_number_of_groups());
+            return self.update_batch_in_single_item(groups, values_as_slice);
+        }
+
         struct PrimOpProcessor<'a, T, F> where
           T: ArrowPrimitiveType + Send,
           F: Fn(&mut T::Native, T::Native) + Send + Sync + 'static,
@@ -245,9 +258,8 @@ where
                 // TODO - null state update?
             }
 
-            fn fallback(&mut self, row_index: usize, group_index: usize) -> Result<()> {
+            fn fallback(&mut self, row_index: usize, _group_index: usize) {
                 (self.acc.prim_fn)(&mut self.acc.in_progress, self.values_as_slice[row_index]);
-                Ok(())
             }
         }
 
@@ -462,3 +474,146 @@ where
 //         Ok(())
 //     }
 // }
+
+#[cfg(test)]
+mod ordered_tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::Int64Type;
+    use datafusion_expr_common::ordered_groups_accumulator::GroupsProperties;
+
+    /// Builds a [`GroupsInfo`] with the leading run of single item groups
+    /// (allowing a bigger first group), like the aggregation does
+    fn groups_info(ranges: &[(usize, usize, bool)], start_group_index: usize) -> GroupsInfo {
+        let single_item_start = usize::from(ranges[0].1 - ranges[0].0 != 1);
+        let single_item_end = single_item_start
+            + ranges[single_item_start..]
+                .iter()
+                .take_while(|(start, end, _)| end - start == 1)
+                .count();
+        GroupsInfo::new(
+            ranges
+                .iter()
+                .map(|&(start, end, is_same_as_before)| PartitionRange {
+                    start,
+                    end,
+                    is_same_as_before,
+                })
+                .collect(),
+            GroupsProperties {
+                range_of_single_item_groups: single_item_start..single_item_end,
+            },
+            start_group_index,
+        )
+    }
+
+    #[test]
+    fn sum_single_item_groups_first_batch() -> Result<()> {
+        let mut acc = sum_accumulator();
+
+        // first batch, every group has one row: groups 0..4 (3 is in progress)
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4]));
+        let groups = groups_info(
+            &[(0, 1, false), (1, 2, false), (2, 3, false), (3, 4, false)],
+            0,
+        );
+        assert!(groups.are_all_single_item());
+        acc.update_batch(&[values], &groups, None)?;
+
+        assert_eq!(
+            acc.evaluate(EmitTo::All)?.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![1, 2, 3, 4])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sum_single_item_groups_then_nulls() -> Result<()> {
+        let mut acc = sum_accumulator();
+
+        // group 0 = [1, 2], groups 1, 2 = [3], [4], group 3 = [5, 6] (in progress)
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6]));
+        let groups = groups_info(
+            &[(0, 2, false), (2, 3, false), (3, 4, false), (4, 6, false)],
+            0,
+        );
+        assert!(groups.are_all_single_item_ignoring_edges());
+        acc.update_batch(&[values], &groups, None)?;
+
+        // group 3 continues with [null], group 4 = [null]
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![None, None]));
+        acc.update_batch(&[values], &groups_info(&[(0, 1, true), (1, 2, false)], 3), None)?;
+
+        assert_eq!(
+            acc.evaluate(EmitTo::All)?.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![Some(3), Some(3), Some(4), Some(11), None])
+        );
+        Ok(())
+    }
+
+    fn sum_accumulator() -> PrimitiveOrderedGroupsAccumulator<Int64Type, impl Fn(&mut i64, i64) + Send + Sync> {
+        PrimitiveOrderedGroupsAccumulator::<Int64Type, _>::new(&DataType::Int64, |x: &mut i64, y: i64| *x += y)
+    }
+
+    #[test]
+    fn sum_without_nulls_across_batches() -> Result<()> {
+        let mut acc = sum_accumulator();
+
+        // single group batch: group 0 = [1, 2]
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+        acc.update_batch(&[values], &groups_info(&[(0, 2, false)], 0), None)?;
+
+        // group 0 continues with [3], group 1 = [4], group 2 = [5, 6] (in progress)
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![3, 4, 5, 6]));
+        acc.update_batch(
+            &[values],
+            &groups_info(&[(0, 1, true), (1, 2, false), (2, 4, false)], 0),
+            None,
+        )?;
+
+        assert_eq!(
+            acc.evaluate(EmitTo::First(2))?.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![6, 4])
+        );
+
+        // group 0 (previously 2) continues with [7], group 1 = [8]
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![7, 8]));
+        acc.update_batch(&[values], &groups_info(&[(0, 1, true), (1, 2, false)], 0), None)?;
+
+        assert_eq!(
+            acc.evaluate(EmitTo::All)?.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![18, 8])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sum_with_nulls_and_filter() -> Result<()> {
+        let mut acc = sum_accumulator();
+
+        // group 0 = [1, null], group 1 = [null], group 2 = [2 (filtered), 3]
+        let values: ArrayRef =
+            Arc::new(Int64Array::from(vec![Some(1), None, None, Some(2), Some(3)]));
+        let filter = BooleanArray::from(vec![true, true, true, false, true]);
+        acc.update_batch(
+            &[values],
+            &groups_info(&[(0, 2, false), (2, 3, false), (3, 5, false)], 0),
+            Some(&filter),
+        )?;
+
+        // group 2 continues with [4 (filtered)], group 3 = [5 (filtered)]
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![4, 5]));
+        let filter = BooleanArray::from(vec![false, false]);
+        acc.update_batch(
+            &[values],
+            &groups_info(&[(0, 1, true), (1, 2, false)], 2),
+            Some(&filter),
+        )?;
+
+        assert_eq!(
+            acc.evaluate(EmitTo::All)?.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![Some(1), None, Some(3), None])
+        );
+        Ok(())
+    }
+}

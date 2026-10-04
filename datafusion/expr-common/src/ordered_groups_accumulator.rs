@@ -1,8 +1,7 @@
 use std::fmt::Debug;
 use std::ops::Range;
-use arrow::array::{ArrayRef, BooleanArray};
+use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::buffer::{BooleanBuffer, NullBuffer};
-use arrow::compute::prep_null_mask_filter;
 use datafusion_common::Result;
 use crate::groups_accumulator::{EmitTo, GroupsAccumulator};
 
@@ -33,6 +32,14 @@ pub trait ProcessGroups {
   }
 
   fn fallback(&mut self, row_index: usize, group_index: usize);
+}
+
+/// `true` for rows where the filter is `Some(true)`
+fn filter_to_mask(filter: &BooleanArray) -> BooleanBuffer {
+  match filter.nulls() {
+    Some(nulls) => filter.values() & nulls.inner(),
+    None => filter.values().clone(),
+  }
 }
 
 /// Hold a range for a partition in a batch (start..end) and whether this partition is the same as the previous one
@@ -91,17 +98,27 @@ pub struct GroupsInfo {
 
 impl GroupsInfo {
   pub fn new(groups: Vec<PartitionRange>, properties: GroupsProperties, start_group_index: usize) -> Self {
-    let total_number_of_rows: usize = groups.iter().map(|g| g.len()).sum();
+    // The groups are dense and start at row 0, so the last group ends at the last row
+    let total_number_of_rows = groups.last().map_or(0, |g| g.end);
 
-    // assert the groups are sorted, dense and non overlapping
-    for i in 0..groups.len() {
-      assert_ne!(groups[i].len(), 0, "group length must be non zero");
-      if i > 0 {
-        assert_eq!(groups[i].start, groups[i - 1].end, "groups are overlapping or not sorted");
-      } else {
-        assert_eq!(groups[0].start, 0, "first group must start at 0");
+    // This is on the hot path (called for every batch), so only validate in debug builds
+    if cfg!(debug_assertions) {
+      // assert the groups are sorted, dense and non overlapping
+      for i in 0..groups.len() {
+        debug_assert!(groups[i].end > groups[i].start, "group length must be non zero");
+        if i > 0 {
+          debug_assert_eq!(groups[i].start, groups[i - 1].end, "groups are overlapping or not sorted");
+        } else {
+          debug_assert_eq!(groups[0].start, 0, "first group must start at 0");
+        }
       }
-        assert!(groups[i].end > groups[i].start, "group end must be greater than start");
+
+      let single_item_groups = &properties.range_of_single_item_groups;
+      debug_assert!(single_item_groups.end <= groups.len(), "range of single item groups out of bounds");
+      debug_assert!(
+        groups[single_item_groups.clone()].iter().all(|g| g.len() == 1),
+        "range of single item groups contains a group with more than one item"
+      );
     }
     Self {
       groups,
@@ -209,14 +226,13 @@ impl GroupsInfo {
   pub fn process(&self, nulls: Option<&NullBuffer>, opt_filter: Option<&BooleanArray>, processor: &mut impl ProcessGroups) -> Result<()> {
     let mask = match (nulls.filter(|n| n.null_count() > 0), opt_filter) {
       (None, None) => None,
-      (None, Some(filter)) => Some(prep_null_mask_filter(filter).into_parts().0),
+      (None, Some(filter)) => Some(filter_to_mask(filter)),
       (Some(valids), None) => Some(valids.inner().clone()),
       (Some(valids), Some(filter)) => {
         debug_assert_eq!(filter.len(), self.total_number_of_rows);
         debug_assert_eq!(valids.len(), self.total_number_of_rows);
 
-        let filter_mask = prep_null_mask_filter(filter).into_parts().0;
-        Some(&filter_mask & valids.inner())
+        Some(&filter_to_mask(filter) & valids.inner())
       }
     };
 

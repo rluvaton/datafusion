@@ -32,7 +32,7 @@ use arrow::{
     datatypes::{DataType, Field},
 };
 use datafusion_expr::DistinctHandling;
-use datafusion_expr::{EmitTo, GroupSelection, GroupsAccumulator, GroupsInfo, OrderedGroupsAccumulator};
+use datafusion_expr::{EmitTo, GroupSelection, GroupsAccumulator};
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::accumulate::accumulate_multiple;
 use log::debug;
 
@@ -44,7 +44,6 @@ use datafusion_expr::{
     function::{AccumulatorArgs, StateFieldsArgs},
     utils::{AggregateOrderSensitivity, format_state_name},
 };
-use datafusion_expr::ordered_groups_accumulator::{PartitionRange, ProcessGroups};
 use datafusion_functions_aggregate_common::stats::StatsType;
 use datafusion_macros::user_doc;
 

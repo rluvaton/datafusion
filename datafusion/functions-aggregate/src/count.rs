@@ -17,7 +17,7 @@
 
 use arrow::{
     array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array, PrimitiveArray},
-    buffer::BooleanBuffer,
+    buffer::{BooleanBuffer, NullBuffer},
     compute,
     datatypes::{
         DataType, Date32Type, Date64Type, Decimal128Type, Decimal256Type, Field,
@@ -59,7 +59,6 @@ use std::{
     ops::BitAnd,
     sync::Arc,
 };
-use datafusion_functions_aggregate_common::aggregate::ordered_groups_accumulator::OrderedGroupsAccumulatorAdapter;
 
 make_udaf_expr_and_func!(
     Count,
@@ -385,6 +384,17 @@ impl AggregateUDFImpl for Count {
             return Ok(Box::new(CountGroupsAccumulator::new()));
         }
         create_distinct_count_groups_accumulator(&args)
+    }
+
+    fn ordered_groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
+        args.expr_fields.len() == 1 && !args.is_distinct
+    }
+
+    fn create_ordered_groups_accumulator(
+        &self,
+        _args: AccumulatorArgs,
+    ) -> Result<Box<dyn OrderedGroupsAccumulator>> {
+        Ok(Box::new(CountsOrderedGroupsAccumulator::new()))
     }
 
     fn reverse_expr(&self) -> ReversedUDAF {
@@ -824,50 +834,94 @@ impl GroupsAccumulator for CountGroupsAccumulator {
 }
 
 
+/// [`OrderedGroupsAccumulator`] for `COUNT` when the input is sorted by the group keys
+#[derive(Debug, Default)]
 struct CountsOrderedGroupsAccumulator {
+    /// Counts of the groups that are done and ready to be emitted
     ready_counts: Vec<i64>,
+    /// Count of the in progress group
     current_count: i64,
 }
 
-impl OrderedGroupsAccumulator for CountsOrderedGroupsAccumulator {
-    fn update_batch(&mut self, input: &[ArrayRef], groups: &GroupsInfo, opt_filter: Option<&BooleanArray>) -> Result<()> {
-        assert_eq!(input.len(), 1, "single argument to update_batch");
-        let values = &input[0];
+impl CountsOrderedGroupsAccumulator {
+    fn new() -> Self {
+        Self::default()
+    }
 
+    /// Adds to each group either the number of rows (when `partial_counts` is `None`)
+    /// or the sum of `partial_counts` of its rows, ignoring rows that are null
+    /// in `nulls` or filtered out
+    fn add_counts(
+        &mut self,
+        partial_counts: Option<&[i64]>,
+        nulls: Option<&NullBuffer>,
+        groups: &GroupsInfo,
+        opt_filter: Option<&BooleanArray>,
+    ) -> Result<()> {
         struct CountProcessor<'a> {
-            acc: &'a mut CountsOrderedGroupsAccumulator
+            acc: &'a mut CountsOrderedGroupsAccumulator,
+            partial_counts: Option<&'a [i64]>,
         }
 
-        impl ProcessGroups for CountProcessor {
+        impl CountProcessor<'_> {
+            fn count(&self, group: &PartitionRange) -> i64 {
+                match self.partial_counts {
+                    None => group.len() as i64,
+                    Some(partial_counts) => partial_counts[group.as_range()].iter().sum(),
+                }
+            }
+        }
+
+        impl ProcessGroups for CountProcessor<'_> {
             fn on_new_standalone_group(&mut self, group: &PartitionRange, _group_index: usize) {
-                self.acc.ready_counts.push(group.len() as i64);
+                let count = self.count(group);
+                self.acc.ready_counts.push(count);
             }
 
             fn flush_in_progress_group(&mut self, opt_group: Option<&PartitionRange>, _group_index: usize) {
-                self.acc.current_count += opt_group.map_or(0, |g| g.len() as i64);
+                self.acc.current_count += opt_group.map_or(0, |g| self.count(g));
                 self.acc.ready_counts.push(self.acc.current_count);
                 self.acc.current_count = 0;
             }
 
             fn add_last_group(&mut self, last_group: &PartitionRange, _group_index: usize) {
-                self.acc.current_count += last_group.len() as i64;
+                self.acc.current_count += self.count(last_group);
             }
 
-            fn fallback(&mut self, _row_index: usize, _group_index: usize) -> Result<()> {
-                self.acc.current_count += 1;
-                Ok(())
+            fn fallback(&mut self, row_index: usize, _group_index: usize) {
+                self.acc.current_count += self
+                    .partial_counts
+                    .map_or(1, |partial_counts| partial_counts[row_index]);
             }
         }
 
-        groups.process(values.logical_nulls().as_ref(), opt_filter, &mut CountProcessor {
-            acc: self
-        })?;
+        groups.process(
+            nulls,
+            opt_filter,
+            &mut CountProcessor {
+                acc: self,
+                partial_counts,
+            },
+        )
+    }
+}
 
-        Ok(())
+impl OrderedGroupsAccumulator for CountsOrderedGroupsAccumulator {
+    fn update_batch(&mut self, input: &[ArrayRef], groups: &GroupsInfo, opt_filter: Option<&BooleanArray>) -> Result<()> {
+        assert_eq!(input.len(), 1, "single argument to update_batch");
+        let nulls = input[0].logical_nulls();
+        self.add_counts(None, nulls.as_ref(), groups, opt_filter)
     }
 
     fn merge_batch(&mut self, input: &[ArrayRef], groups: &GroupsInfo) -> Result<()> {
-        self.update_batch(input, groups, None)
+        assert_eq!(input.len(), 1, "one partial count to merge");
+        let partial_counts = input[0].as_primitive::<Int64Type>();
+        self.add_counts(
+            Some(partial_counts.values()),
+            partial_counts.nulls(),
+            groups,
+            None,
+        )
     }
 
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
@@ -1045,6 +1099,66 @@ mod tests {
     use datafusion_expr::function::AccumulatorArgs;
     use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
     use std::sync::Arc;
+
+    fn ordered_groups(
+        ranges: &[(usize, usize, bool)],
+        start_group_index: usize,
+    ) -> GroupsInfo {
+        use datafusion_expr::ordered_groups_accumulator::GroupsProperties;
+        GroupsInfo::new(
+            ranges
+                .iter()
+                .map(|&(start, end, is_same_as_before)| PartitionRange {
+                    start,
+                    end,
+                    is_same_as_before,
+                })
+                .collect(),
+            GroupsProperties {
+                range_of_single_item_groups: 0..0,
+            },
+            start_group_index,
+        )
+    }
+
+    #[test]
+    fn ordered_count_update_and_merge() -> Result<()> {
+        let mut acc = CountsOrderedGroupsAccumulator::new();
+
+        // group 0 = [1, null], group 1 = [2, 3 (filtered)] (in progress)
+        let values: ArrayRef =
+            Arc::new(Int32Array::from(vec![Some(1), None, Some(2), Some(3)]));
+        let filter = BooleanArray::from(vec![true, true, true, false]);
+        acc.update_batch(
+            &[values],
+            &ordered_groups(&[(0, 2, false), (2, 4, false)], 0),
+            Some(&filter),
+        )?;
+
+        // group 1 continues with [4], group 2 = [5, 6]
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![4, 5, 6]));
+        acc.update_batch(
+            &[values],
+            &ordered_groups(&[(0, 1, true), (1, 3, false)], 1),
+            None,
+        )?;
+        assert_eq!(
+            acc.evaluate(EmitTo::First(2))?.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![1, 2])
+        );
+
+        // merge partial counts: group 0 (previously 2) continues with [3], group 1 = [4, 5]
+        let partial_counts: ArrayRef = Arc::new(Int64Array::from(vec![3, 4, 5]));
+        acc.merge_batch(
+            &[partial_counts],
+            &ordered_groups(&[(0, 1, true), (1, 3, false)], 0),
+        )?;
+        assert_eq!(
+            acc.evaluate(EmitTo::All)?.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![5, 9])
+        );
+        Ok(())
+    }
     /// Helper function to create a dictionary array with non-null keys but some null values
     /// Returns a dictionary array where:
     /// - keys are [0, 1, 2, 0, 1] (all non-null)

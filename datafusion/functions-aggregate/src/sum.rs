@@ -41,10 +41,11 @@ use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::{AggregateOrderSensitivity, format_state_name};
 use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Coercion, Documentation, Expr, GroupsAccumulator,
-    Operator, ReversedUDAF, SetMonotonicity, Signature, StatisticsArgs, TypeSignature,
+    Operator, OrderedGroupsAccumulator, ReversedUDAF, SetMonotonicity, Signature, StatisticsArgs, TypeSignature,
     TypeSignatureClass, Volatility,
 };
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::prim_op::PrimitiveGroupsAccumulator;
+use datafusion_functions_aggregate_common::aggregate::ordered_groups_accumulator::prim_op::PrimitiveOrderedGroupsAccumulator;
 use datafusion_functions_aggregate_common::aggregate::sum_distinct::DistinctSumAccumulator;
 use datafusion_macros::user_doc;
 use datafusion_physical_expr::expressions::{CastExpr, Column};
@@ -309,6 +310,25 @@ impl AggregateUDFImpl for Sum {
         macro_rules! helper {
             ($t:ty, $dt:expr) => {
                 Ok(Box::new(PrimitiveGroupsAccumulator::<$t, _>::new(
+                    &$dt,
+                    |x, y| *x = x.add_wrapping(y),
+                )))
+            };
+        }
+        downcast_sum!(args, helper)
+    }
+
+    fn ordered_groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
+        !args.is_distinct
+    }
+
+    fn create_ordered_groups_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn OrderedGroupsAccumulator>> {
+        macro_rules! helper {
+            ($t:ty, $dt:expr) => {
+                Ok(Box::new(PrimitiveOrderedGroupsAccumulator::<$t, _>::new(
                     &$dt,
                     |x, y| *x = x.add_wrapping(y),
                 )))
