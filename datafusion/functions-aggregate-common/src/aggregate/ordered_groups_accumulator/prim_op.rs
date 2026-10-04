@@ -19,13 +19,15 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use super::accumulate::OrderedNullState;
-use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray};
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array, PrimitiveArray};
 use arrow::buffer::NullBuffer;
 use arrow::compute;
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::datatypes::DataType;
 use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
+use datafusion_expr_common::groups_accumulator::EmitTo;
 use datafusion_expr_common::ordered_groups_accumulator::{AllSingleItemType, GroupsInfo, OrderedGroupsAccumulator, PartitionRange, ProcessGroups};
+use crate::aggregate::groups_accumulator::accumulate::NullState;
 
 /// An accumulator that implements a single operation over
 /// [`ArrowPrimitiveType`] where the accumulated state is the same as
@@ -55,7 +57,8 @@ where
     starting_value: T::Native,
 
     /// Track nulls in the input / filters
-    null_state: OrderedNullState,
+    // null_state: OrderedNullState,
+    null_state: NullState,
 
     /// Function that computes the primitive result
     prim_fn: F,
@@ -71,7 +74,8 @@ where
             ready_values: vec![],
             in_progress: T::default_value(),
             data_type: data_type.clone(),
-            null_state: OrderedNullState::new(),
+            // null_state: OrderedNullState::new(),
+            null_state: NullState::new(),
             starting_value: T::default_value(),
             prim_fn,
         }
@@ -190,58 +194,88 @@ where
         assert_eq!(values.len(), 1, "single argument to update_batch");
         let values = values[0].as_primitive::<T>();
 
-        if opt_filter.is_some() {
-            panic!("PrimitiveOrderedGroupsAccumulator does not support filters yet");
-        }
-
-        if values.null_count() > 0 {
-            panic!("PrimitiveOrderedGroupsAccumulator does not support nulls yet");
-        }
-
         let values_as_slice = values.values().as_ref();
 
-        struct PrimOpProcessor;
+        struct PrimOpProcessor<'a, T, F> where
+          T: ArrowPrimitiveType + Send,
+          F: Fn(&mut T::Native, T::Native) + Send + Sync + 'static,
+        {
+            acc: &'a mut PrimitiveOrderedGroupsAccumulator<T, F>,
+            values_as_slice: &'a [T::Native],
+        }
 
-        impl ProcessGroups for PrimOpProcessor {
-            type A = PrimitiveOrderedGroupsAccumulator<T, F>;
+        impl<'a, T, F> ProcessGroups for PrimOpProcessor<'a, T, F>
+        where
+            T: ArrowPrimitiveType + Send,
+            F: Fn(&mut T::Native, T::Native) + Send + Sync + 'static,
+        {
 
-            fn on_new_standalone_group(t: &mut Self::A, group: &PartitionRange) {
-                let mut value = t.starting_value;
+            fn on_new_standalone_group(&mut self, group: &PartitionRange, group_index: usize) {
+                let mut value = self.acc.starting_value;
                 self.values_as_slice[group.start..group.end]
                   .iter()
                   .for_each(|&new_value| {
-                      (t.prim_fn)(&mut value, new_value);
+                      (self.acc.prim_fn)(&mut value, new_value);
                   });
 
-                t.ready_values.push(value);
+                self.acc.ready_values.push(value);
 
                 // TODO - null state update?
             }
 
-            fn flush_in_progress_group(t: &mut Self::A, opt_group: Option<&PartitionRange>) {
+            fn flush_in_progress_group(&mut self, opt_group: Option<&PartitionRange>, group_index: usize) {
                 if let Some(group) = opt_group {
                     self.values_as_slice[group.start..group.end]
                       .iter()
                       .for_each(|&new_value| {
-                          (t.prim_fn)(&mut t.in_progress, new_value);
+                          (self.acc.prim_fn)(&mut self.acc.in_progress, new_value);
                       });
                 }
-                t.ready_values.push(t.in_progress);
-                t.in_progress = t.starting_value;
+                self.acc.ready_values.push(self.acc.in_progress);
+                self.acc.in_progress = self.acc.starting_value;
                 // TODO - null state update?
             }
 
-            fn add_last_group(t: &mut Self::A, last_group: &PartitionRange) {
+            fn add_last_group(&mut self, last_group: &PartitionRange, group_index: usize) {
                 self.values_as_slice[last_group.start..last_group.end]
                   .iter()
                   .for_each(|&new_value| {
-                      (t.prim_fn)(&mut t.in_progress, new_value);
+                      (self.acc.prim_fn)(&mut self.acc.in_progress, new_value);
                   });
                 // TODO - null state update?
             }
+
+            fn fallback(&mut self, row_index: usize, group_index: usize) -> Result<()> {
+                (self.acc.prim_fn)(&mut self.acc.in_progress, self.values_as_slice[row_index]);
+                Ok(())
+            }
         }
 
-        groups.process::<PrimOpProcessor>(values, opt_filter, self)?;
+        if opt_filter.is_some() || values.null_count() > 0 {
+            let group_indices = groups.as_iter_of_group_indices().collect::<Vec<_>>();
+
+            self.null_state.accumulate(
+                &group_indices,
+                values,
+                opt_filter,
+                groups.total_number_of_groups(),
+                |group_index, new_value| {
+                    // TODO - avoid double processing
+                    // Not doing anything since we process separately
+                },
+            );
+        } else {
+            self.null_state.mark_addition_not_nulls(groups.total_number_of_groups());
+        }
+
+        groups.process(
+            values.nulls(),
+            opt_filter,
+            &mut PrimOpProcessor {
+                acc: self,
+                values_as_slice,
+            }
+        )?;
 
         // // update values
         // // self.ready_values.resize(groups.total_number_of_groups(), self.starting_value);
@@ -341,24 +375,38 @@ where
         Ok(())
     }
 
-    fn evaluate(&mut self, take_in_progress: bool) -> Result<ArrayRef> {
-        if take_in_progress {
-            // Avoid reserving double by push in case the capacity needed to be increased
-            self.ready_values.reserve_exact(1);
-            self.ready_values.push(self.in_progress);
-            self.in_progress = self.starting_value;
-        }
+    fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        let nulls = self.null_state.build(emit_to);
+        let values = match emit_to {
+            EmitTo::All => {
+                let mut values = std::mem::take(&mut self.ready_values);
+                values.push(self.in_progress);
+                self.in_progress = self.starting_value;
 
-        let values = std::mem::take(&mut self.ready_values);
+                values
+            },
+            EmitTo::First(n) if n == self.ready_values.len() => {
+                std::mem::take(&mut self.ready_values)
+            },
+            EmitTo::First(n) if n == self.ready_values.len() + 1 => {
+                let mut values = std::mem::take(&mut self.ready_values);
+                values.push(self.in_progress);
+                self.in_progress = self.starting_value;
+                values
+            }
+            EmitTo::First(_) => {
+                emit_to.take_needed(&mut self.ready_values)
+            },
+        };
 
-        let nulls = self.null_state.build(take_in_progress);
         let values = PrimitiveArray::<T>::new(values.into(), nulls) // no copy
-            .with_data_type(self.data_type.clone());
+          .with_data_type(self.data_type.clone());
+
         Ok(Arc::new(values))
     }
 
-    fn state(&mut self, take_in_progress: bool) -> Result<Vec<ArrayRef>> {
-        self.evaluate(take_in_progress).map(|arr| vec![arr])
+    fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        self.evaluate(emit_to).map(|arr| vec![arr])
     }
 
     fn merge_batch(

@@ -55,6 +55,7 @@ use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{AggregateUDF, Expr, ReversedUDAF, SetMonotonicity};
 use datafusion_expr_common::accumulator::{Accumulator, AggregateMetrics};
 use datafusion_expr_common::groups_accumulator::GroupsAccumulator;
+use datafusion_expr_common::ordered_groups_accumulator::OrderedGroupsAccumulator;
 use datafusion_expr_common::type_coercion::aggregates::check_arg_count;
 use datafusion_functions_aggregate_common::accumulator::{
     AccumulatorArgs, StateFieldsArgs,
@@ -950,6 +951,54 @@ impl AggregateFunctionExpr {
     ) -> Result<Box<dyn GroupsAccumulator>> {
         let mut accumulator = self.create_groups_accumulator()?;
         accumulator.set_metrics(metrics);
+        Ok(accumulator)
+    }
+
+    /// If the aggregate expression has a specialized
+    /// [`GroupsAccumulator`] implementation. If this returns true,
+    /// `[Self::create_groups_accumulator`] will be called.
+    pub fn ordered_groups_accumulator_supported(&self) -> bool {
+        let args = AccumulatorArgs {
+            return_field: Arc::clone(&self.return_field),
+            schema: &self.schema,
+            expr_fields: &self.arg_fields,
+            ignore_nulls: self.ignore_nulls,
+            order_bys: self.order_bys.as_ref(),
+            is_distinct: self.is_distinct,
+            name: &self.name,
+            is_reversed: self.is_reversed,
+            exprs: &self.args,
+        };
+        self.fun.ordered_groups_accumulator_supported(args)
+    }
+
+    /// Return a specialized [`GroupsAccumulator`] that manages state
+    /// for all groups.
+    ///
+    /// For maximum performance, a [`GroupsAccumulator`] should be
+    /// implemented in addition to [`Accumulator`].
+    pub fn create_ordered_groups_accumulator(&self) -> Result<Box<dyn OrderedGroupsAccumulator>> {
+        let args = AccumulatorArgs {
+            return_field: Arc::clone(&self.return_field),
+            schema: &self.schema,
+            expr_fields: &self.arg_fields,
+            ignore_nulls: self.ignore_nulls,
+            order_bys: self.order_bys.as_ref(),
+            is_distinct: self.is_distinct,
+            name: &self.name,
+            is_reversed: self.is_reversed,
+            exprs: &self.args,
+        };
+        self.fun.create_ordered_groups_accumulator(args)
+    }
+
+    /// Creates a groups accumulator and supplies optional aggregate-owned metrics.
+    pub fn create_ordered_groups_accumulator_with_metrics(
+        &self,
+        _metrics: Arc<dyn AggregateMetrics>,
+    ) -> Result<Box<dyn OrderedGroupsAccumulator>> {
+        let mut accumulator = self.create_ordered_groups_accumulator()?;
+        // accumulator.set_metrics(metrics);
         Ok(accumulator)
     }
 

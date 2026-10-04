@@ -831,33 +831,37 @@ struct CountsOrderedGroupsAccumulator {
 
 impl OrderedGroupsAccumulator for CountsOrderedGroupsAccumulator {
     fn update_batch(&mut self, input: &[ArrayRef], groups: &GroupsInfo, opt_filter: Option<&BooleanArray>) -> Result<()> {
-        // TODO - this is only if input is non null
         assert_eq!(input.len(), 1, "single argument to update_batch");
         let values = &input[0];
-        assert_eq!(values.logical_null_count(), 0, "nulls are not supported (need to implement to not count non nulls)");
-        assert!(opt_filter.is_none(), "filter is not supported");
 
-        struct CountProcessor;
+        struct CountProcessor<'a> {
+            acc: &'a mut CountsOrderedGroupsAccumulator
+        }
 
         impl ProcessGroups for CountProcessor {
-            type A = CountsOrderedGroupsAccumulator;
-
-            fn on_new_standalone_group(t: &mut Self::A, group: &PartitionRange) {
-                t.ready_counts.push(group.len() as i64);
+            fn on_new_standalone_group(&mut self, group: &PartitionRange, _group_index: usize) {
+                self.acc.ready_counts.push(group.len() as i64);
             }
 
-            fn flush_in_progress_group(t: &mut Self::A, opt_group: Option<&PartitionRange>) {
-                t.current_count += opt_group.map_or(0, |g| g.len() as i64);
-                t.ready_counts.push(t.current_count);
-                t.current_count = 0;
+            fn flush_in_progress_group(&mut self, opt_group: Option<&PartitionRange>, _group_index: usize) {
+                self.acc.current_count += opt_group.map_or(0, |g| g.len() as i64);
+                self.acc.ready_counts.push(self.acc.current_count);
+                self.acc.current_count = 0;
             }
 
-            fn add_last_group(t: &mut Self::A, last_group: &PartitionRange) {
-                t.current_count += last_group.len() as i64;
+            fn add_last_group(&mut self, last_group: &PartitionRange, _group_index: usize) {
+                self.acc.current_count += last_group.len() as i64;
+            }
+
+            fn fallback(&mut self, _row_index: usize, _group_index: usize) -> Result<()> {
+                self.acc.current_count += 1;
+                Ok(())
             }
         }
 
-        groups.process::<CountProcessor>(input, opt_filter, self)?;
+        groups.process(values.logical_nulls().as_ref(), opt_filter, &mut CountProcessor {
+            acc: self
+        })?;
 
         Ok(())
     }
