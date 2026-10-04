@@ -1,13 +1,13 @@
 use std::fmt::Debug;
-use std::ops::{BitAnd, Range};
-use arrow::array::{Array, ArrayRef, ArrowPrimitiveType, BooleanArray, PrimitiveArray};
+use std::ops::Range;
+use arrow::array::{ArrayRef, BooleanArray};
 use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::compute::prep_null_mask_filter;
 use datafusion_common::Result;
 use crate::groups_accumulator::{EmitTo, GroupsAccumulator};
 
 pub trait ProcessGroups {
-  fn reserve_for_n_new_groups(&mut self, n: usize) {
+  fn reserve_for_n_new_groups(&mut self, _n: usize) {
     // default implementation does nothing, but can be overridden to reserve space for new groups
   }
 
@@ -148,7 +148,7 @@ impl GroupsInfo {
       };
 
       // This is the only group
-      if !last_group.is_same_as_before {
+      if !last_group.is_same_as_before && self.start_group_index > 0 {
         // the prev group index is the last group index - 1
         processor.flush_in_progress_group(None, self.start_group_index - 1);
       }
@@ -189,20 +189,17 @@ impl GroupsInfo {
     }
 
     let mut current_group_index = self.start_group_index;
-    let mut processed_rows_in_group = 0;
 
     for ((row_index, should_process), group_index) in mask.iter().enumerate().zip(self.as_iter_of_group_indices()) {
-      // Fully filtered groups
-      if processed_rows_in_group > 0 && group_index != current_group_index {
-        // Flush the last group index
+      // Groups are dense, so a change in group index means the current group is done
+      // (even if all its rows were filtered out)
+      if group_index != current_group_index {
         processor.flush_in_progress_group(None, current_group_index);
         current_group_index = group_index;
-        processed_rows_in_group = 0;
       }
 
       if should_process {
         processor.fallback(row_index, group_index);
-        processed_rows_in_group += 1;
       }
     }
 
@@ -213,7 +210,7 @@ impl GroupsInfo {
     let mask = match (nulls.filter(|n| n.null_count() > 0), opt_filter) {
       (None, None) => None,
       (None, Some(filter)) => Some(prep_null_mask_filter(filter).into_parts().0),
-      (Some(valids), None) => Some(valids.into_inner()),
+      (Some(valids), None) => Some(valids.inner().clone()),
       (Some(valids), Some(filter)) => {
         debug_assert_eq!(filter.len(), self.total_number_of_rows);
         debug_assert_eq!(valids.len(), self.total_number_of_rows);
@@ -237,7 +234,7 @@ impl GroupsInfo {
   }
 
   /// Return iterator of (group_index, T)
-  pub fn as_iter_of_group_indices_with_match<T>(&self, slice: &[T], include_last_group: bool) -> impl Iterator<Item = (usize, T)> + '_ {
+  pub fn as_iter_of_group_indices_with_match<T>(&self, _slice: &[T], _include_last_group: bool) -> std::iter::Empty<(usize, T)> {
     todo!()
     // self.groups.iter().enumerate().flat_map(|(group_index, group)| std::iter::repeat_n(group_index, group.len()))
   }
@@ -246,13 +243,12 @@ impl GroupsInfo {
     self.total_number_of_rows
   }
 
+  /// Total number of groups including the ones from previous batches.
+  ///
+  /// `start_group_index` is the index of the first group in this batch (which is the
+  /// last group from the previous batch when `is_first_group_same_as_before`)
   pub fn total_number_of_groups(&self) -> usize {
-    let total = self.start_group_index + self.groups.len();
-    if self.is_first_group_same_as_before() {
-       total - 1
-    } else {
-      total
-    }
+    self.start_group_index + self.groups.len()
   }
 
   pub fn num_new_groups(&self) -> usize {
@@ -282,7 +278,7 @@ impl GroupsInfo {
 
   // TODO - Check this with 1 groups, 2 groups, since it might have a bug there
   pub fn are_all_single_item_ignoring_edges(&self) -> bool {
-    let range_of_single_item_groups = self.properties().range_of_single_item_groups;
+    let range_of_single_item_groups = &self.properties().range_of_single_item_groups;
     range_of_single_item_groups.start <= 1 && range_of_single_item_groups.end >= self.groups().len() - 1
   }
 

@@ -997,7 +997,7 @@ impl AggregateFunctionExpr {
         &self,
         _metrics: Arc<dyn AggregateMetrics>,
     ) -> Result<Box<dyn OrderedGroupsAccumulator>> {
-        let mut accumulator = self.create_ordered_groups_accumulator()?;
+        let accumulator = self.create_ordered_groups_accumulator()?;
         // accumulator.set_metrics(metrics);
         Ok(accumulator)
     }

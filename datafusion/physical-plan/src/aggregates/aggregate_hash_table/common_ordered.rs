@@ -21,11 +21,16 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use arrow::array::ArrayRef;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use datafusion_common::Result;
+use datafusion_common::{Result, internal_err};
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
-use datafusion_expr::{AggregateMetrics, EmitTo};
+use datafusion_expr::ordered_groups_accumulator::{
+    GroupsProperties, OrderedGroupsAccumulatorWrapper, PartitionRange,
+};
+use datafusion_expr::{AggregateMetrics, EmitTo, GroupsInfo, OrderedGroupsAccumulator};
+use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 
 use crate::InputOrderMode;
 use crate::PhysicalExpr;
@@ -41,8 +46,8 @@ use crate::aggregates::{
 
 use super::AggregateTableMetrics;
 use super::common::{
-    AggregateAccumulator, AggregateBatchFn, AggregateHashTable, EvaluatedAggregateBatch,
-    MaterializeAccumulatorFn, create_group_accumulator,
+    AggregateHashTable, CompactedAccumulatorArgs, HashAggregateAccumulator,
+    RowAlignedAccumulatorArgs, create_group_accumulator,
 };
 
 #[derive(Clone)]
@@ -74,6 +79,230 @@ impl OrderedAggregateTableMetrics {
             submetrics: table.aggregate_submetrics.clone(),
         }
     }
+}
+
+/// Create an accumulator for `agg_expr` -- an [`OrderedGroupsAccumulator`] if
+/// that is supported by the aggregate, or an [`OrderedGroupsAccumulatorWrapper`]
+/// around the [`GroupsAccumulator`](datafusion_expr::GroupsAccumulator) if not.
+pub(in crate::aggregates) fn create_ordered_group_accumulator(
+    agg_expr: &Arc<AggregateFunctionExpr>,
+    metrics: Arc<dyn AggregateMetrics>,
+) -> Result<Box<dyn OrderedGroupsAccumulator>> {
+    if agg_expr.ordered_groups_accumulator_supported() {
+        agg_expr.create_ordered_groups_accumulator_with_metrics(metrics)
+    } else {
+        create_group_accumulator(agg_expr, metrics).map(|acc| {
+            Box::new(OrderedGroupsAccumulatorWrapper::from(acc))
+                as Box<dyn OrderedGroupsAccumulator>
+        })
+    }
+}
+
+/// State and argument information for a single aggregate in the ordered table.
+pub(super) enum OrderedAggregateAccumulator {
+    /// The input is fully sorted by the group keys (and there is a single
+    /// grouping set), so the groups of each batch are contiguous runs of
+    /// consecutive group indices and can be described by [`GroupsInfo`].
+    Ordered(HashAggregateAccumulator<dyn OrderedGroupsAccumulator>),
+
+    /// The input is only partially sorted or there are multiple grouping sets,
+    /// so the group indices of a batch are not contiguous runs.
+    Unordered(HashAggregateAccumulator),
+}
+
+/// Evaluated arguments for one [`OrderedAggregateAccumulator`].
+pub(super) enum OrderedAccumulatorArgs {
+    /// Used by [`OrderedAggregateAccumulator::Ordered`].
+    ///
+    /// The arguments keep one row per input row and the `FILTER` is passed to
+    /// the accumulator, so groups whose rows are all filtered out are still
+    /// part of the dense [`GroupsInfo`].
+    RowAligned(RowAlignedAccumulatorArgs),
+
+    /// Used by [`OrderedAggregateAccumulator::Unordered`].
+    Compacted(CompactedAccumulatorArgs),
+}
+
+/// Group assignment of the rows of one input batch.
+pub(super) enum BatchGroups<'a> {
+    /// Used by [`OrderedAggregateAccumulator::Ordered`].
+    Ordered(&'a GroupsInfo),
+
+    /// Used by [`OrderedAggregateAccumulator::Unordered`].
+    Indices {
+        /// One group index per input row.
+        group_indices: &'a [usize],
+        /// Total number of groups currently interned, including new groups.
+        total_num_groups: usize,
+    },
+}
+
+/// Evaluated group keys and accumulator arguments for one input batch.
+pub(super) struct OrderedEvaluatedAggregateBatch {
+    /// One entry per grouping set; each entry contains all evaluated group key
+    /// arrays for the current input batch.
+    pub(super) grouping_set_args: Vec<Vec<ArrayRef>>,
+
+    /// One entry per aggregate expression.
+    pub(super) accumulator_args: Vec<OrderedAccumulatorArgs>,
+}
+
+/// Function used by [`OrderedAggregateTable::aggregate_evaluated_batch`] to
+/// update one accumulator with one evaluated input batch.
+pub(super) type OrderedAggregateBatchFn = fn(
+    &mut OrderedAggregateAccumulator,
+    &OrderedAccumulatorArgs,
+    &BatchGroups<'_>,
+) -> Result<()>;
+
+/// Function used by [`OrderedAggregateTable::materialize_groups`] to
+/// materialize one accumulator's output columns.
+pub(super) type OrderedMaterializeAccumulatorFn =
+    fn(&mut OrderedAggregateAccumulator, EmitTo) -> Result<Vec<ArrayRef>>;
+
+impl OrderedAggregateAccumulator {
+    fn evaluate_args(&self, batch: &RecordBatch) -> Result<OrderedAccumulatorArgs> {
+        match self {
+            Self::Ordered(acc) => acc
+                .evaluate_row_aligned_args(batch)
+                .map(OrderedAccumulatorArgs::RowAligned),
+            Self::Unordered(acc) => acc
+                .evaluate_compacted_args(batch)
+                .map(OrderedAccumulatorArgs::Compacted),
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            Self::Ordered(acc) => acc.accumulator.size(),
+            Self::Unordered(acc) => acc.size(),
+        }
+    }
+
+    pub(super) fn update_batch(
+        &mut self,
+        values: &OrderedAccumulatorArgs,
+        groups: &BatchGroups<'_>,
+    ) -> Result<()> {
+        match (self, values, groups) {
+            (
+                Self::Ordered(acc),
+                OrderedAccumulatorArgs::RowAligned(values),
+                BatchGroups::Ordered(groups),
+            ) => acc.accumulator.update_batch(
+                &values.arguments,
+                groups,
+                values.filter.as_ref(),
+            ),
+            (
+                Self::Unordered(acc),
+                OrderedAccumulatorArgs::Compacted(values),
+                BatchGroups::Indices {
+                    group_indices,
+                    total_num_groups,
+                },
+            ) => acc.update_batch(values, group_indices, *total_num_groups),
+            _ => internal_err!("mismatched ordered aggregate accumulator inputs"),
+        }
+    }
+
+    pub(super) fn merge_batch(
+        &mut self,
+        values: &OrderedAccumulatorArgs,
+        groups: &BatchGroups<'_>,
+    ) -> Result<()> {
+        match (self, values, groups) {
+            (
+                Self::Ordered(acc),
+                OrderedAccumulatorArgs::RowAligned(values),
+                BatchGroups::Ordered(groups),
+            ) => {
+                debug_assert!(values.filter.is_none());
+                acc.accumulator.merge_batch(&values.arguments, groups)
+            }
+            (
+                Self::Unordered(acc),
+                OrderedAccumulatorArgs::Compacted(values),
+                BatchGroups::Indices {
+                    group_indices,
+                    total_num_groups,
+                },
+            ) => acc.merge_batch(values, group_indices, *total_num_groups),
+            _ => internal_err!("mismatched ordered aggregate accumulator inputs"),
+        }
+    }
+
+    pub(super) fn evaluate_to_columns(
+        &mut self,
+        emit_to: EmitTo,
+    ) -> Result<Vec<ArrayRef>> {
+        match self {
+            Self::Ordered(acc) => Ok(vec![acc.accumulator.evaluate(emit_to)?]),
+            Self::Unordered(acc) => acc.evaluate_to_columns(emit_to),
+        }
+    }
+
+    pub(super) fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        match self {
+            Self::Ordered(acc) => acc.accumulator.state(emit_to),
+            Self::Unordered(acc) => acc.state(emit_to),
+        }
+    }
+}
+
+/// Builds the [`GroupsInfo`] of one input batch from its interned group
+/// indices when the input is fully sorted by the group keys.
+///
+/// `starting_num_groups` is the number of groups before interning the batch.
+/// The first run continues the previous batch's last group when its index is
+/// `starting_num_groups - 1`, and every following run must use the next index.
+fn build_groups_info(
+    group_indices: &[usize],
+    starting_num_groups: usize,
+) -> Result<GroupsInfo> {
+    debug_assert!(!group_indices.is_empty());
+
+    let mut groups = Vec::new();
+    let mut start = 0;
+    let mut expected_group_index = None;
+    for run in group_indices.chunk_by(|a, b| a == b) {
+        let group_index = run[0];
+        let is_same_as_before = match expected_group_index {
+            None if group_index + 1 == starting_num_groups => true,
+            None if group_index == starting_num_groups => false,
+            Some(expected) if group_index == expected => false,
+            _ => {
+                return internal_err!(
+                    "ordered aggregation expects contiguous group indices, got group {group_index} \
+                     after {expected_group_index:?} (starting with {starting_num_groups} groups)"
+                );
+            }
+        };
+        groups.push(PartitionRange {
+            start,
+            end: start + run.len(),
+            is_same_as_before,
+        });
+        start += run.len();
+        expected_group_index = Some(group_index + 1);
+    }
+
+    // Leading run of single item groups, allowing the first group (which may
+    // continue the previous batch) to have more than one item.
+    let single_item_start = usize::from(groups[0].len() != 1);
+    let single_item_end = single_item_start
+        + groups[single_item_start..]
+            .iter()
+            .take_while(|group| group.len() == 1)
+            .count();
+
+    Ok(GroupsInfo::new(
+        groups,
+        GroupsProperties {
+            range_of_single_item_groups: single_item_start..single_item_end,
+        },
+        group_indices[0],
+    ))
 }
 
 /// Aggregate table shared by the ordered single, partial and final paths.
@@ -166,11 +395,17 @@ pub(super) struct OrderedAggregateTableBuffer {
     /// Scratch group id vector for the current input batch.
     pub(super) group_indices: Vec<usize>,
 
+    /// Whether the accumulators are [`OrderedAggregateAccumulator::Ordered`].
+    ///
+    /// True when the input is fully sorted by the group keys and there is a
+    /// single grouping set.
+    pub(super) use_ordered_accumulators: bool,
+
     /// One item per aggregate expression.
     ///
     /// Example: `COUNT(x), SUM(y)` creates two items. Each item owns the input
     /// expressions, optional filter, and accumulator state for all groups.
-    pub(super) accumulators: Vec<AggregateAccumulator>,
+    pub(super) accumulators: Vec<OrderedAggregateAccumulator>,
 }
 
 /// Methods shared by all aggregate modes
@@ -190,6 +425,8 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
         metrics: OrderedAggregateTableMetrics,
     ) -> Result<Self> {
         let group_ordering = GroupOrdering::try_new(input_order_mode)?;
+        let use_ordered_accumulators = matches!(group_ordering, GroupOrdering::Full(_))
+            && agg.group_by().groups().len() == 1;
         let group_schema = agg.group_by().group_schema(input_schema)?;
         let group_values = new_group_values(group_schema, &group_ordering)?;
         let aggregate_arguments = aggregate_expressions(
@@ -204,15 +441,33 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
             .zip(filters)
             .zip(metrics.submetrics.iter())
             .map(|(((agg_expr, arguments), filter), submetrics)| {
-                let accumulator =
-                    create_group_accumulator(agg_expr, Arc::clone(submetrics))?;
-                Ok(AggregateAccumulator::new(
-                    Arc::clone(agg_expr),
-                    arguments,
-                    filter,
-                    accumulator,
-                    Arc::clone(submetrics),
-                ))
+                if use_ordered_accumulators {
+                    let accumulator = create_ordered_group_accumulator(
+                        agg_expr,
+                        Arc::clone(submetrics),
+                    )?;
+                    Ok(OrderedAggregateAccumulator::Ordered(
+                        HashAggregateAccumulator::new(
+                            Arc::clone(agg_expr),
+                            arguments,
+                            filter,
+                            accumulator,
+                            Arc::clone(submetrics),
+                        ),
+                    ))
+                } else {
+                    let accumulator =
+                        create_group_accumulator(agg_expr, Arc::clone(submetrics))?;
+                    Ok(OrderedAggregateAccumulator::Unordered(
+                        HashAggregateAccumulator::new(
+                            Arc::clone(agg_expr),
+                            arguments,
+                            filter,
+                            accumulator,
+                            Arc::clone(submetrics),
+                        ),
+                    ))
+                }
             })
             .collect::<Result<_>>()?;
 
@@ -228,6 +483,7 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
                 group_ordering,
                 group_values,
                 group_indices: vec![],
+                use_ordered_accumulators,
                 accumulators,
             },
             _mode: PhantomData,
@@ -241,7 +497,7 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
     pub(super) fn evaluate_batch(
         &self,
         batch: &RecordBatch,
-    ) -> Result<EvaluatedAggregateBatch> {
+    ) -> Result<OrderedEvaluatedAggregateBatch> {
         let grouping_set_args =
             self.group_by_metrics.time_group_key_preparation(|| {
                 evaluate_group_by(&self.buffer.group_by, batch)
@@ -254,12 +510,12 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
                 .enumerate()
                 .map(|(idx, acc)| {
                     self.aggregate_argument_metrics
-                        .time(idx, || acc.evaluate_compacted_args(batch))
+                        .time(idx, || acc.evaluate_args(batch))
                 })
                 .collect::<Result<Vec<_>>>()
         })?;
 
-        Ok(EvaluatedAggregateBatch {
+        Ok(OrderedEvaluatedAggregateBatch {
             grouping_set_args,
             accumulator_args,
         })
@@ -357,31 +613,51 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
     /// Each aggregation mode chooses a different `aggregate_fn` according to its
     /// semantics. For example, partial aggregation takes raw inputs and updates
     /// stored partial states, so it uses
-    /// [`datafusion_expr::GroupsAccumulator::update_batch`].
+    /// [`OrderedAggregateAccumulator::update_batch`].
     pub(super) fn aggregate_evaluated_batch(
         &mut self,
-        evaluated_batch: &EvaluatedAggregateBatch,
-        aggregate_fn: AggregateBatchFn,
+        evaluated_batch: &OrderedEvaluatedAggregateBatch,
+        aggregate_fn: OrderedAggregateBatchFn,
         accumulator_phase: AccumulatorPhase,
     ) -> Result<()> {
         let accumulator_metrics = Arc::clone(&self.aggregate_accumulator_metrics);
         let group_by_metrics = self.group_by_metrics.clone();
         for group_values in &evaluated_batch.grouping_set_args {
-            let total_num_groups = group_by_metrics.time_group_key_preparation(|| {
-                let starting_num_groups = self.buffer.group_values.len();
-                self.buffer
-                    .group_values
-                    .intern(group_values, &mut self.buffer.group_indices)?;
-                let total_num_groups = self.buffer.group_values.len();
-                if total_num_groups > starting_num_groups {
-                    self.buffer.group_ordering.new_groups(
-                        group_values,
-                        &self.buffer.group_indices,
+            let (starting_num_groups, total_num_groups) = group_by_metrics
+                .time_group_key_preparation(|| {
+                    let starting_num_groups = self.buffer.group_values.len();
+                    self.buffer
+                        .group_values
+                        .intern(group_values, &mut self.buffer.group_indices)?;
+                    let total_num_groups = self.buffer.group_values.len();
+                    if total_num_groups > starting_num_groups {
+                        self.buffer.group_ordering.new_groups(
+                            group_values,
+                            &self.buffer.group_indices,
+                            total_num_groups,
+                        )?;
+                    }
+                    Ok::<_, datafusion_common::DataFusionError>((
+                        starting_num_groups,
                         total_num_groups,
-                    )?;
+                    ))
+                })?;
+
+            let groups_info;
+            let batch_groups = if self.buffer.use_ordered_accumulators {
+                if self.buffer.group_indices.is_empty() {
+                    continue;
                 }
-                Ok::<_, datafusion_common::DataFusionError>(total_num_groups)
-            })?;
+                groups_info = group_by_metrics.time_group_key_preparation(|| {
+                    build_groups_info(&self.buffer.group_indices, starting_num_groups)
+                })?;
+                BatchGroups::Ordered(&groups_info)
+            } else {
+                BatchGroups::Indices {
+                    group_indices: &self.buffer.group_indices,
+                    total_num_groups,
+                }
+            };
 
             group_by_metrics.time_aggregation(|| {
                 for (idx, (acc, values)) in self
@@ -392,12 +668,7 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
                     .enumerate()
                 {
                     accumulator_metrics.time(idx, accumulator_phase, || {
-                        aggregate_fn(
-                            acc,
-                            values,
-                            &self.buffer.group_indices,
-                            total_num_groups,
-                        )
+                        aggregate_fn(acc, values, &batch_groups)
                     })?;
                 }
                 Ok::<(), datafusion_common::DataFusionError>(())
@@ -412,7 +683,7 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
     pub(super) fn materialize_groups(
         &mut self,
         emit_to: EmitTo,
-        materialize_accumulator_fn: MaterializeAccumulatorFn,
+        materialize_accumulator_fn: OrderedMaterializeAccumulatorFn,
         accumulator_phase: AccumulatorPhase,
     ) -> Result<RecordBatch> {
         let accumulator_metrics = Arc::clone(&self.aggregate_accumulator_metrics);
@@ -438,5 +709,60 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
         debug_assert!(batch.num_rows() > 0);
 
         Ok(batch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ranges(info: &GroupsInfo) -> Vec<(usize, usize, bool)> {
+        info.groups()
+            .iter()
+            .map(|g| (g.start, g.end, g.is_same_as_before))
+            .collect()
+    }
+
+    #[test]
+    fn build_groups_info_first_batch() -> Result<()> {
+        let info = build_groups_info(&[0, 0, 1, 2, 3, 3], 0)?;
+        assert_eq!(
+            ranges(&info),
+            vec![(0, 2, false), (2, 3, false), (3, 4, false), (4, 6, false)]
+        );
+        assert_eq!(info.properties().range_of_single_item_groups, 1..3);
+        assert_eq!(info.total_number_of_groups(), 4);
+        assert_eq!(info.num_new_groups(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn build_groups_info_continues_previous_group() -> Result<()> {
+        // 3 groups already interned, the batch starts with the last one (index 2)
+        let info = build_groups_info(&[2, 2, 3], 3)?;
+        assert_eq!(ranges(&info), vec![(0, 2, true), (2, 3, false)]);
+        assert_eq!(info.total_number_of_groups(), 4);
+        assert_eq!(info.num_new_groups(), 1);
+
+        // the batch starts a new group
+        let info = build_groups_info(&[3, 4, 5], 3)?;
+        assert_eq!(
+            ranges(&info),
+            vec![(0, 1, false), (1, 2, false), (2, 3, false)]
+        );
+        assert_eq!(info.properties().range_of_single_item_groups, 0..3);
+        assert!(info.are_all_single_item());
+        assert_eq!(info.total_number_of_groups(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn build_groups_info_rejects_non_contiguous_groups() {
+        // revisits a group
+        assert!(build_groups_info(&[0, 1, 0], 0).is_err());
+        // skips a group index
+        assert!(build_groups_info(&[0, 2], 0).is_err());
+        // starts with a group that is neither the last one nor a new one
+        assert!(build_groups_info(&[0, 1], 2).is_err());
     }
 }

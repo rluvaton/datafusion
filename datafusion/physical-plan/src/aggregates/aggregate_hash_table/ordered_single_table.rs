@@ -26,8 +26,9 @@ use datafusion_common::Result;
 use crate::aggregates::aggregate_hash_table::SingleMarker;
 use crate::aggregates::{AggregateExec, AggregateMode, group_values::AccumulatorPhase};
 
-use super::common::HashAggregateAccumulator;
-use super::common_ordered::{OrderedAggregateTable, OrderedAggregateTableMetrics};
+use super::common_ordered::{
+    OrderedAggregateAccumulator, OrderedAggregateTable, OrderedAggregateTableMetrics,
+};
 
 /// Implementation specific to single aggregation, where the table stores final
 /// aggregate values and the input rows are raw rows.
@@ -73,7 +74,7 @@ impl OrderedAggregateTable<SingleMarker> {
         let evaluated_batch = self.evaluate_batch(batch)?;
         self.aggregate_evaluated_batch(
             &evaluated_batch,
-            HashAggregateAccumulator::update_batch,
+            OrderedAggregateAccumulator::update_batch,
             AccumulatorPhase::Update,
         )
     }
@@ -93,7 +94,7 @@ impl OrderedAggregateTable<SingleMarker> {
         };
         self.materialize_groups(
             emit_to,
-            HashAggregateAccumulator::evaluate_to_columns,
+            OrderedAggregateAccumulator::evaluate_to_columns,
             AccumulatorPhase::Evaluate,
         )
         .map(Some)

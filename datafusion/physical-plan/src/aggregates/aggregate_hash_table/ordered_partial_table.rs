@@ -40,8 +40,9 @@ use crate::aggregates::{
     group_values::AccumulatorPhase,
 };
 
-use super::common::HashAggregateAccumulator;
-use super::common_ordered::{OrderedAggregateTable, OrderedAggregateTableMetrics};
+use super::common_ordered::{
+    OrderedAggregateAccumulator, OrderedAggregateTable, OrderedAggregateTableMetrics,
+};
 
 /// Implementation specific to partial aggregation, where the table stores
 /// partial aggregate states and the input rows are raw rows.
@@ -82,7 +83,7 @@ impl OrderedAggregateTable<PartialMarker> {
         let evaluated_batch = self.evaluate_batch(batch)?;
         self.aggregate_evaluated_batch(
             &evaluated_batch,
-            HashAggregateAccumulator::update_batch,
+            OrderedAggregateAccumulator::update_batch,
             AccumulatorPhase::Update,
         )
     }
@@ -100,7 +101,7 @@ impl OrderedAggregateTable<PartialMarker> {
         };
         self.materialize_groups(
             emit_to,
-            HashAggregateAccumulator::state,
+            OrderedAggregateAccumulator::state,
             AccumulatorPhase::State,
         )
         .map(Some)

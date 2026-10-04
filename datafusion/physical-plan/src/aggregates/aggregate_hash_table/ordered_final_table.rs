@@ -29,8 +29,9 @@ use crate::InputOrderMode;
 use crate::aggregates::aggregate_hash_table::FinalMarker;
 use crate::aggregates::{AggregateExec, AggregateMode, group_values::AccumulatorPhase};
 
-use super::common::HashAggregateAccumulator;
-use super::common_ordered::{OrderedAggregateTable, OrderedAggregateTableMetrics};
+use super::common_ordered::{
+    OrderedAggregateAccumulator, OrderedAggregateTable, OrderedAggregateTableMetrics,
+};
 
 /// Implementation specific to final aggregation, where the table stores partial
 /// aggregate states and the input rows are also partial states.
@@ -73,7 +74,7 @@ impl OrderedAggregateTable<FinalMarker> {
         debug_assert_eq!(evaluated_batch.grouping_set_args.len(), 1);
         self.aggregate_evaluated_batch(
             &evaluated_batch,
-            HashAggregateAccumulator::merge_batch,
+            OrderedAggregateAccumulator::merge_batch,
             AccumulatorPhase::Merge,
         )
     }
@@ -93,7 +94,7 @@ impl OrderedAggregateTable<FinalMarker> {
         };
         self.materialize_groups(
             emit_to,
-            HashAggregateAccumulator::evaluate_to_columns,
+            OrderedAggregateAccumulator::evaluate_to_columns,
             AccumulatorPhase::Evaluate,
         )
         .map(Some)

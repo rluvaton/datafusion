@@ -385,7 +385,7 @@ pub trait Accumulator: Send + Sync + Debug + std::any::Any {
     /// `Accumulator` instances.
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()>;
 
-    fn state_into_evaluate(&self, states: Vec<ScalarValue>) -> Result<ScalarValue> {
+    fn state_into_evaluate(&self, _states: Vec<ScalarValue>) -> Result<ScalarValue> {
         internal_err!("state_into_evaluate should be implemented for aggregate functions when used with custom window frame queries")
     }
 

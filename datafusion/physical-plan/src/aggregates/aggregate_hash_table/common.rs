@@ -519,7 +519,11 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
 ///
 /// For example, for `SELECT COUNT(x), SUM(y WHERE z > 10) ...`  there would be two
 /// `HashAggregateAccumulator`, one each for `COUNT(x)` and `SUM(y WHERE z > 10)`
-pub(super) struct HashAggregateAccumulator {
+///
+/// `Acc` is the accumulator trait object holding the per-group state, the
+/// ordered aggregate table uses `dyn OrderedGroupsAccumulator` when the input is
+/// fully sorted by the group keys.
+pub(super) struct HashAggregateAccumulator<Acc: ?Sized = dyn GroupsAccumulator> {
     /// Aggregate expression used to create a fresh accumulator for related
     /// hash tables, such as the partial-skip table.
     aggregate_expr: Arc<AggregateFunctionExpr>,
@@ -535,7 +539,7 @@ pub(super) struct HashAggregateAccumulator {
     filter: Option<Arc<dyn PhysicalExpr>>,
 
     /// Accumulator state for all groups for one aggregate expression.
-    accumulator: Box<dyn GroupsAccumulator>,
+    pub(super) accumulator: Box<Acc>,
 
     /// Optional internal metrics owned by this aggregate expression.
     submetrics: Arc<dyn AggregateMetrics>,
@@ -710,12 +714,12 @@ fn compact_group_indices(
     Some(compacted)
 }
 
-impl HashAggregateAccumulator {
+impl<Acc: ?Sized> HashAggregateAccumulator<Acc> {
     pub(super) fn new(
         aggregate_expr: Arc<AggregateFunctionExpr>,
         arguments: Vec<Arc<dyn PhysicalExpr>>,
         filter: Option<Arc<dyn PhysicalExpr>>,
-        accumulator: Box<dyn GroupsAccumulator>,
+        accumulator: Box<Acc>,
         submetrics: Arc<dyn AggregateMetrics>,
     ) -> Self {
         Self {
@@ -725,20 +729,6 @@ impl HashAggregateAccumulator {
             accumulator,
             submetrics,
         }
-    }
-
-    /// Construct a new accumulator with the same definition, but with empty internal
-    /// state buffers (empty [`GroupsAccumulator`]).
-    pub(super) fn empty_like(&self) -> Result<Self> {
-        let accumulator =
-            create_group_accumulator(&self.aggregate_expr, Arc::clone(&self.submetrics))?;
-        Ok(Self::new(
-            Arc::clone(&self.aggregate_expr),
-            self.arguments.clone(),
-            self.filter.clone(),
-            accumulator,
-            Arc::clone(&self.submetrics),
-        ))
     }
 
     /// Evaluate aggregate arguments and filter for one input batch.
@@ -828,6 +818,36 @@ impl HashAggregateAccumulator {
             .transpose()
     }
 
+    pub(super) fn null_arguments(
+        &self,
+        input_schema: &SchemaRef,
+        num_rows: usize,
+    ) -> Result<Vec<ArrayRef>> {
+        self.arguments
+            .iter()
+            .map(|expr| {
+                let data_type = expr.data_type(input_schema)?;
+                Ok(new_null_array(&data_type, num_rows))
+            })
+            .collect()
+    }
+}
+
+impl HashAggregateAccumulator {
+    /// Construct a new accumulator with the same definition, but with empty internal
+    /// state buffers (empty [`GroupsAccumulator`]).
+    pub(super) fn empty_like(&self) -> Result<Self> {
+        let accumulator =
+            create_group_accumulator(&self.aggregate_expr, Arc::clone(&self.submetrics))?;
+        Ok(Self::new(
+            Arc::clone(&self.aggregate_expr),
+            self.arguments.clone(),
+            self.filter.clone(),
+            accumulator,
+            Arc::clone(&self.submetrics),
+        ))
+    }
+
     pub(super) fn size(&self) -> usize {
         self.accumulator.size()
     }
@@ -890,20 +910,6 @@ impl HashAggregateAccumulator {
     ) -> Result<Vec<ArrayRef>> {
         self.accumulator
             .convert_to_state(&values.arguments, values.filter.as_ref())
-    }
-
-    pub(super) fn null_arguments(
-        &self,
-        input_schema: &SchemaRef,
-        num_rows: usize,
-    ) -> Result<Vec<ArrayRef>> {
-        self.arguments
-            .iter()
-            .map(|expr| {
-                let data_type = expr.data_type(input_schema)?;
-                Ok(new_null_array(&data_type, num_rows))
-            })
-            .collect()
     }
 }
 
